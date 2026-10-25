@@ -2,6 +2,10 @@
 
 DSH 侧边栏「测试日志」页签：在 GUI 里跑测试，输出**逐行实时**出现，结束后给出失败汇总。
 
+![测试日志面板](docs/screenshot.png)
+
+> 截图用示例数据渲染（`/workspace/service`、`github.com/example/*` 均为占位），面板的配色与布局来自 `src/client/index.js`。
+
 ## 它解决什么
 
 `go test ./...` 的输出有三个问题：跑得久、被 `| tail` 吞掉、失败信息埋在几百行里。
