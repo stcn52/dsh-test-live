@@ -160,6 +160,8 @@ window.__ModuleLoader__.load({
       var runsState = React.useState([])
       var runs = runsState[0]
       var setRuns = runsState[1]
+      // The strip scrolls horizontally; keep the newest run (host order) in view.
+      var runsRef = React.useRef(null)
       var currentState = React.useState(null)
       var current = currentState[0]
       var setCurrent = currentState[1]
@@ -224,6 +226,11 @@ window.__ModuleLoader__.load({
         })
         if (entry.seq > lastSeqRef.current) lastSeqRef.current = entry.seq
       }, [])
+
+      React.useEffect(function () {
+        var el = runsRef.current
+        if (el) el.scrollLeft = 0
+      }, [runs])
 
       /** Load the run list. */
       var refreshRuns = React.useCallback(function () {
@@ -468,7 +475,7 @@ window.__ModuleLoader__.load({
           h('button', { disabled: busy, onClick: startFollow, title: '实时 tail 这个文件（外部命令写入）' }, '跟随'),
         ),
         runs.length > 0
-          ? h('div', { className: 'dtl-runs' }, runs.map(function (item) {
+          ? h('div', { className: 'dtl-runs', ref: runsRef }, runs.map(function (item) {
             var packagesOk = item.summary ? item.summary.packages.ok.length : 0
             var failed = item.summary && (item.summary.packages.fail.length > 0 || item.summary.tests.fail > 0)
             var isFile = item.kind === 'file'

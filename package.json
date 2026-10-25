@@ -1,6 +1,6 @@
 {
   "name": "dsh-test-live",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Live test log panel for DeepSeek Harness: run a test command from the sidebar, stream its output line by line over SSE, and keep a per-run summary. Ships Go test-aware line classification (package results, FAIL/RUN markers, build errors) and three tools the model can call.",
   "type": "module",
   "main": "src/index.js",
