@@ -1,0 +1,43 @@
+# dsh-test-live bundle patch
+#
+# Installed through the official CLI:
+#
+#   dsh plugin --profile <name> add <path-to-this-package>
+#
+# The plugin manager reconciles `dsh.profile.bundles` against installed packages
+# and appends `dsh-test-live` to the bundle stack; profile boot then merges THIS
+# patch, which inserts exactly one plugin row.
+#
+# The row id doubles as the settings namespace: override any value below in the
+# profile's own cordis.patch.yml with an id-targeted config entry.
+- insert:
+    - id: test-live
+      name: 'dsh-test-live'
+      config:
+        # Working directory of the test command. `null` means "the host process
+        # working directory", resolved per run.
+        cwd: null
+        # The executable. Only this binary is ever spawned: the HTTP surface
+        # cannot run arbitrary commands.
+        command: 'go'
+        # Fixed leading arguments; the run options append to these.
+        baseArgs: ['test']
+        # Extra environment variables for the child process.
+        env: {}
+        # How many finished runs stay queryable (newest kept).
+        maxRuns: 8
+        # Per-run line buffer ceiling; older lines are dropped (seq keeps counting).
+        maxLines: 20000
+        # Default wall-clock cap in seconds, overridable per run.
+        defaultTimeoutSec: 900
+        # File-follow mode: an external writer (terminal, bash, CI) tees into a
+        # file and the panel tails it. followRoot bounds which files are
+        # readable; null means "same as cwd".
+        followRoot: null
+        # How often a followed file is polled, in milliseconds.
+        followIntervalMs: 300
+        # Panel appearance only; the run protocol itself is unaffected.
+        ui:
+          autoScroll: true
+          # Restrict the package input to relative patterns (./..., ./pkg).
+          packagesPlaceholder: './...'
