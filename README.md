@@ -26,7 +26,7 @@ DSH 侧边栏「测试日志」页签：在 GUI 里跑测试，输出**逐行实
 ## 安装
 
 ```bash
-dsh plugin --profile web add /home/chenyang/opt/dsh-test-live
+dsh plugin --profile web add github:stcn52/dsh-test-live
 ```
 
 包内自带 `cordis.patch.yml`，插件管理器会把它并入 `dsh.profile.bundles`，重启/重载 profile
@@ -40,7 +40,7 @@ dsh plugin --profile web add /home/chenyang/opt/dsh-test-live
 - id: test-live
   name: 'dsh-test-live'
   config:
-    cwd: /home/chenyang/ai/kk/golang/kmicro   # null = 宿主进程工作目录
+    cwd: /workspace/service   # null = 宿主进程工作目录
     command: go
     baseArgs: [test]
     defaultTimeoutSec: 900
