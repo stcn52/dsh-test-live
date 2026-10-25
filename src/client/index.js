@@ -458,7 +458,7 @@ window.__ModuleLoader__.load({
             type: 'text',
             className: 'dtl-grow',
             value: followPath,
-            placeholder: '跟随日志文件（如 fulltest.log）：终端里 go test ./... | tee fulltest.log',
+            placeholder: '跟随日志文件（如 fulltest.log）',
             spellCheck: false,
             onChange: function (event) { setFollowPath(event.target.value) },
             onKeyDown: function (event) {
