@@ -41,5 +41,13 @@
   },
   "scripts": {
     "test": "node --test tests/*.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stcn52/dsh-test-live.git"
+  },
+  "homepage": "https://github.com/stcn52/dsh-test-live#readme",
+  "bugs": {
+    "url": "https://github.com/stcn52/dsh-test-live/issues"
   }
 }
