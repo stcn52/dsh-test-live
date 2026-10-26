@@ -18,7 +18,7 @@ import { randomUUID } from 'node:crypto'
 import { spawn as nodeSpawn } from 'node:child_process'
 import { lstatSync, realpathSync } from 'node:fs'
 import { open, stat } from 'node:fs/promises'
-import { basename, dirname, join, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { assertPattern, assertTargets, normalizeRunOptions } from './config.js'
 import { classifyLine, createSummary, deriveStatus, migrateSummary, observeLine, summarize } from './parse.js'
 import { RUNNERS, buildRunArgv, detectRunner, runnerCatalog } from './runners.js'
@@ -177,13 +177,70 @@ export function resolveFollowPath(inputPath, settings, root) {
 }
 
 /**
+ * The root a follow path without an explicit root resolves against.
+ *
+ * A relative path keeps the historical default (the first configured root). An
+ * absolute path names its own root, so it is matched against the whole
+ * allow-list: with several configured roots the first one is only the default
+ * for relative paths, not the only tolerated one, and a log under the second
+ * root must not be refused as "outside" the first.
+ *
+ * When no root contains it the call is refused. The wording keeps the
+ * historical `follow path "…" is outside …` shape but lists every allowed root,
+ * because with several roots naming only the default one would be misleading.
+ * @param inputPath - trimmed caller path.
+ * @param roots - absolute allow-list.
+ * @param fallbackRoot - root to use when the list is empty.
+ * @returns absolute base directory.
+ */
+function baseFor(inputPath, roots, fallbackRoot) {
+  if (!isAbsolute(inputPath)) return resolve(roots[0] ?? fallbackRoot ?? process.cwd())
+  const owner = rootContaining(inputPath, roots)
+  if (owner !== null) return owner
+  const allowed = roots.map(candidate => resolve(candidate))
+  if (allowed.length === 0) return resolve(fallbackRoot ?? process.cwd())
+  throw new Error(`follow path "${inputPath}" is outside ${allowed.join(', ')}`)
+}
+
+/**
+ * The allowed root that contains an absolute path.
+ *
+ * The comparison runs on real paths, like the containment check itself, so a
+ * symlink planted inside a root cannot smuggle the path out of it. The tail may
+ * be missing — a followed log legitimately appears after the follow starts — and
+ * {@link realPathLenient} handles that by resolving the deepest existing ancestor
+ * and re-appending the missing part.
+ *
+ * A dangling symlink has no real location, so it is matched literally; that only
+ * selects the error wording (the caller's own dangling guard reports it), it
+ * never grants access on its own.
+ * @param inputPath - absolute path.
+ * @param roots - absolute allow-list.
+ * @returns the matching root, or null when no root contains the path.
+ */
+function rootContaining(inputPath, roots) {
+  const target = resolve(inputPath)
+  const targetReal = realPathLenient(target)
+  const probe = targetReal ?? target
+  for (const candidate of roots) {
+    const base = resolve(candidate)
+    const baseReal = targetReal === null ? base : (realPathLenient(base) ?? base)
+    const prefix = baseReal.endsWith(sep) ? baseReal : baseReal + sep
+    if (probe === baseReal || probe.startsWith(prefix)) return base
+  }
+  return null
+}
+
+/**
  * Resolve a follow path against an explicit allow-list.
  *
  * The list is a parameter because the hub validates against
  * {@link followRootsFor}: the deployment roots *plus* the calling session's own
  * working directory, so a conversation may follow a log in the project it is
- * working in without that path having to be in the static profile.
- * @param inputPath - caller-supplied path.
+ * working in without that path having to be in the static profile. Without an
+ * explicit root the base comes from {@link baseFor}: the first root for a
+ * relative path, the root that actually contains it for an absolute one.
+ * @param inputPath - caller-supplied path (absolute or relative to the root).
  * @param roots - absolute allow-list (first entry is the default root).
  * @param fallbackRoot - root to use when the list is empty.
  * @param root - optional explicit root; must be in `roots`.
@@ -193,8 +250,9 @@ function resolveFollowPathIn(inputPath, roots, fallbackRoot, root) {
   if (typeof inputPath !== 'string' || inputPath.trim() === '') {
     throw new Error('follow path is required')
   }
-  if (root !== undefined && root !== null) assertConfiguredRoot(root, roots)
-  const base = resolve(root ?? roots[0] ?? fallbackRoot ?? process.cwd())
+  const explicit = root === undefined || root === null ? null : root
+  if (explicit !== null) assertConfiguredRoot(explicit, roots)
+  const base = explicit !== null ? resolve(explicit) : baseFor(inputPath.trim(), roots, fallbackRoot)
   const target = resolve(base, inputPath.trim())
   const baseReal = realPathLenient(base) ?? base
   const targetReal = realPathLenient(target)

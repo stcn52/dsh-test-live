@@ -641,6 +641,39 @@ test('follow accepts a log inside the conversation cwd', { skip: typeof createHu
   hub.dispose()
 })
 
+test('POST /follow follows an absolute path that lives in the second of several roots', async () => {
+  const rootA = await mkdtemp(join(tmpdir(), 'dsh-test-live-rootA-'))
+  const rootB = await mkdtemp(join(tmpdir(), 'dsh-test-live-rootB-'))
+  await writeFile(join(rootB, 'fulltest.log'), 'ok  \tpkg/b\t0.1s\n', 'utf8')
+  const { ctx, scopes } = fakeContext()
+  const hub = createHub(testConfig({ followRoots: [rootA, rootB], followIntervalMs: 100 }))
+  registerRoutes(ctx, hub, stubResolver())
+  const [route] = enterScope(scopes[0])
+
+  // No conversation at all: the request carries no cwd, so `selectFollowRoot` can
+  // name no root and the hub itself has to pick the one containing the path. This
+  // is the shape that used to be refused as "outside" the first root.
+  const anonymous = await callRoute(route, 'POST', '/test-live/follow', { path: join(rootB, 'fulltest.log') })
+  assert.equal(anonymous.statusCode, 202)
+  assert.equal(JSON.parse(anonymous.body()).file, join(rootB, 'fulltest.log'))
+
+  // A conversation working elsewhere (the stub's /repo/a) must not re-root it
+  // either: the log's own root wins, not the first configured one.
+  const scoped = await callRoute(route, 'POST', '/test-live/follow', {
+    path: join(rootB, 'fulltest.log'),
+    sessionId: 's1',
+  })
+  assert.equal(scoped.statusCode, 202)
+  assert.equal(JSON.parse(scoped.body()).file, join(rootB, 'fulltest.log'))
+
+  // Outside every root is still the hub's 400, with the wording the panel shows.
+  const elsewhere = await mkdtemp(join(tmpdir(), 'dsh-test-live-elsewhere-'))
+  const refused = await callRoute(route, 'POST', '/test-live/follow', { path: join(elsewhere, 'run.log') })
+  assert.equal(refused.statusCode, 400)
+  assert.match(JSON.parse(refused.body()).error, /outside/)
+  hub.dispose()
+})
+
 test('GET /status falls back to the newest run of the named conversation', async () => {
   const hub = stubHub(TWO_RUNS)
   const route = mountStub(hub, stubResolver())

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { appendFile, mkdtemp, writeFile } from 'node:fs/promises'
+import { appendFile, mkdtemp, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -240,4 +240,96 @@ test('a follow without a context records no conversation', async () => {
   assert.equal(meta.sessionLabel, null)
   assert.equal(meta.archived, false)
   hub.dispose()
+})
+
+// ---------------------------------------------------------------------------
+// Multiple configured roots: the first root is the default for *relative* paths
+// only. An absolute path names its own root, so a log under the second root must
+// not be refused as "outside" the first one (regression: a follow whose
+// conversation has no cwd reached the hub with no explicit root at all).
+// ---------------------------------------------------------------------------
+
+/**
+ * Two existing roots, each holding one log.
+ * @returns {{ rootA: string, rootB: string }}
+ */
+async function twoRoots() {
+  const rootA = await mkdtemp(join(tmpdir(), 'dsh-test-live-rootA-'))
+  const rootB = await mkdtemp(join(tmpdir(), 'dsh-test-live-rootB-'))
+  await writeFile(join(rootA, 'run.log'), 'ok  \tpkg/a\t0.1s\n', 'utf8')
+  await writeFile(join(rootB, 'fulltest.log'), 'ok  \tpkg/b\t0.1s\n', 'utf8')
+  return { rootA, rootB }
+}
+
+test('an absolute path in the second of several roots is followed there', async () => {
+  const { rootA, rootB } = await twoRoots()
+  const hub = createHub(testConfig({ followRoots: [rootA, rootB], followIntervalMs: 100 }))
+
+  // No explicit root and no context: the hub has to choose the root itself, which
+  // is the shape a follow takes when the calling conversation has no cwd
+  // (src/host/routes.js then passes no root at all).
+  const meta = hub.follow(join(rootB, 'fulltest.log'))
+  assert.equal(meta.kind, 'file')
+  assert.equal(meta.file, join(rootB, 'fulltest.log'))
+  assert.equal(meta.cwd, rootB, 'the followed log decides the run directory')
+  assert.ok(await waitFor(() => hub.linesSince(meta.id, -1).some(entry => entry.text.startsWith('ok  '))))
+
+  // Both roots stay reachable: matching the second one must not make the first
+  // one unreachable, and a relative path still lands in the first root.
+  assert.equal(hub.follow(join(rootA, 'run.log')).file, join(rootA, 'run.log'))
+  assert.equal(hub.follow('run.log').file, join(rootA, 'run.log'))
+  hub.dispose()
+})
+
+test('an absolute path outside every root is still refused and names the roots', async () => {
+  const { rootA, rootB } = await twoRoots()
+  const elsewhere = await mkdtemp(join(tmpdir(), 'dsh-test-live-elsewhere-'))
+  await writeFile(join(elsewhere, 'run.log'), 'x\n', 'utf8')
+  const hub = createHub(testConfig({ followRoots: [rootA, rootB] }))
+
+  // The wording is what the panel's error box shows, so it is asserted: with
+  // several roots a message naming only the default one would be misleading.
+  assert.throws(
+    () => hub.follow(join(elsewhere, 'run.log')),
+    error => /outside/.test(error.message) && error.message.includes(rootA) && error.message.includes(rootB),
+  )
+  assert.equal(hub.list().length, 0)
+  hub.dispose()
+})
+
+test('a symlink inside a root cannot name a file outside every root', async () => {
+  const { rootA, rootB } = await twoRoots()
+  const elsewhere = await mkdtemp(join(tmpdir(), 'dsh-test-live-elsewhere-'))
+  await writeFile(join(elsewhere, 'secret.log'), 'x\n', 'utf8')
+  await symlink(join(elsewhere, 'secret.log'), join(rootB, 'link.log'))
+  const hub = createHub(testConfig({ followRoots: [rootA, rootB] }))
+
+  // Matching the root on the literal path must not weaken the containment test:
+  // the prefix comparison runs on the real path, so the symlink is refused.
+  assert.throws(() => hub.follow(join(rootB, 'link.log')), /outside/)
+  hub.dispose()
+})
+
+test('resolveFollowPath matches an absolute path against every configured root', () => {
+  const settings = testConfig({ followRoots: ['/srv/one', '/srv/two'] })
+  assert.equal(resolveFollowPath('/srv/two/log/run.log', settings), '/srv/two/log/run.log')
+  assert.equal(resolveFollowPath('/srv/one/run.log', settings), '/srv/one/run.log')
+  // A relative path keeps the historical default: the first root, in panel order.
+  assert.equal(resolveFollowPath('run.log', settings), '/srv/one/run.log')
+})
+
+test('a single root keeps the exact wording it always had', () => {
+  const settings = testConfig({ followRoot: '/srv/project' })
+  assert.equal(resolveFollowPath('run.log', settings), '/srv/project/run.log')
+  assert.equal(resolveFollowPath('/srv/project/sub/run.log', settings), '/srv/project/sub/run.log')
+  // Regression pin, not just /outside/: with one root the message is byte-identical
+  // to the one the panel has always shown.
+  assert.throws(
+    () => resolveFollowPath('/etc/passwd', settings),
+    { message: 'follow path "/etc/passwd" is outside /srv/project' },
+  )
+  assert.throws(
+    () => resolveFollowPath('../etc/passwd', settings),
+    { message: 'follow path "../etc/passwd" is outside /srv/project' },
+  )
 })
