@@ -62,7 +62,13 @@ function textOf(value) {
  */
 function runnerLine(meta) {
   const id = textOf(meta?.runner)
-  if (id === null) return 'runner: not recorded'
+  if (id === null) {
+    // A run can legitimately have no runner (a followed file executes nothing,
+    // and an older stored run predates the field). Say so and, when the host
+    // knows why, say why — "not recorded" alone reads like a defect.
+    const reason = textOf(meta?.detectReason)
+    return reason === null ? 'runner: not recorded' : `runner: not recorded (${reason})`
+  }
   const label = textOf(meta.runnerLabel)
   return label === null || label === id ? `runner: ${id}` : `runner: ${id} (${label})`
 }
@@ -103,7 +109,7 @@ function writeWith(runnerId) {
  */
 function followRunner(hub, context, requested) {
   const explicit = textOf(requested)
-  if (explicit !== null && explicit !== AUTO_RUNNER) return explicit
+  if (explicit !== null && explicit !== AUTO_RUNNER) return { id: explicit, reason: null }
   const sessionId = context?.sessionId ?? null
   let latest = null
   try {
@@ -112,17 +118,17 @@ function followRunner(hub, context, requested) {
     latest = null
   }
   const fromRun = textOf(latest?.runner)
-  if (fromRun !== null) return fromRun
+  if (fromRun !== null) return { id: fromRun, reason: '沿用本对话最近一次运行的 runner' }
   const cwd = textOf(context?.cwd)
   if (cwd !== null) {
     try {
       const detected = textOf(detectRunner(cwd)?.id)
-      if (detected !== null) return detected
+      if (detected !== null) return { id: detected, reason: '按对话目录探测到的 runner' }
     } catch {
       // A directory the detector cannot read is not a reason to refuse the follow.
     }
   }
-  return 'go'
+  return { id: 'go', reason: '没有任何证据，沿用默认 runner' }
 }
 
 /**
@@ -418,23 +424,39 @@ export function registerTools(ctx, hub, resolver) {
       // historical runner-less record, and the hint computed below stays a
       // presentation detail (which command to write the log with).
       const requestedRunner = textOf(options.runner)
-      if (requestedRunner !== null) context.runner = requestedRunner
       const root = selectFollowRoot(hub, context, options.path, undefined)
       // Read the hint *before* the follow registers its own file run, or the
       // newest run of the conversation would be the very run this call is
       // creating.
       const hinted = followRunner(hub, context, options.runner)
+      // The hub records what parses the file: an explicit id as-is, `auto` as the
+      // inference above (with its reason), so the counters match the log.
+      if (requestedRunner === null || requestedRunner === AUTO_RUNNER) {
+        // Both "auto" and "the caller named nothing" infer: the record has to
+        // name the grammar the lines are parsed with, or a vitest/pytest log
+        // would be counted by the Go grammar. The inference and its source go to
+        // the hub together, so the record explains itself.
+        context.runner = AUTO_RUNNER
+        context.runnerHint = hinted.id
+        context.runnerHintReason = hinted.reason
+      } else {
+        context.runner = requestedRunner
+      }
       const meta = hub.follow(options.path, root, context)
-      // A runner the hub recorded wins (the caller named it); otherwise the
-      // hint is all this follow has to name the grammar it reads the file with.
-      const runnerId = textOf(meta.runner) ?? hinted
+      // The hint explains which command to write the log with; only the id the
+      // hub actually recorded may be presented as the run's runner. Printing the
+      // hint in the runner line claimed a provenance the run does not have (an
+      // `auto` follow records none, by design).
+      const recorded = textOf(meta.runner)
+      const reason = textOf(meta.detectReason)
+      const runnerText = `runner: ${recorded === null ? 'not recorded' : recorded}`
       return {
         id: meta.id,
         status: meta.status,
-        runner: runnerId,
+        runner: recorded,
         text: `following ${meta.file} as ${meta.id}\n` +
-          `runner: ${runnerId}\n` +
-          `write with: ${writeWith(runnerId)} 2>&1 | tee ${meta.file}`,
+          `${runnerText}${recorded === null || reason === null ? '' : ` (${reason})`}\n` +
+          `write with: ${writeWith(recorded ?? hinted.id)} 2>&1 | tee ${meta.file}`,
       }
     },
   })

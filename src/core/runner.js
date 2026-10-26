@@ -846,7 +846,20 @@ export function createHub(settings, deps = {}) {
   function followRunnerFields(context) {
     const requested = textOrNull(context?.runner)
     if (requested === null) return { runner: null, runnerLabel: null, detectReason: null }
-    if (requested === 'auto') return { runner: null, runnerLabel: null, detectReason: FOLLOW_AUTO_REASON }
+    if (requested === 'auto') {
+      // `auto` means "you pick": the caller (a tool, the panel) may hand over the
+      // runner it inferred and where that inference came from. Recording the
+      // inferred id matters, because it decides the grammar the file is parsed
+      // with — a pytest log under the Go grammar would show wrong counters.
+      const inferred = textOrNull(context?.runnerHint)
+      if (inferred === null) return { runner: null, runnerLabel: null, detectReason: FOLLOW_AUTO_REASON }
+      const hintLabel = Object.hasOwn(RUNNERS, inferred) ? RUNNERS[inferred].label : null
+      return {
+        runner: inferred,
+        runnerLabel: hintLabel,
+        detectReason: textOrNull(context?.runnerHintReason) ?? FOLLOW_AUTO_REASON,
+      }
+    }
     const label = Object.hasOwn(RUNNERS, requested) ? RUNNERS[requested].label : null
     return { runner: requested, runnerLabel: label, detectReason: null }
   }

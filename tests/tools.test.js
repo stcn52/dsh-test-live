@@ -543,14 +543,21 @@ test('test_live_follow records the runner it was asked to parse with', async () 
   const pytest = follow({ path: 'run.log', runner: 'pytest' })
   assert.equal(real.get(pytest.id).runner, 'pytest')
 
-  // `auto` on a follow is honestly unresolved: there is no argv to detect from.
+  // `auto` on a follow records the runner the call inferred, plus why it did:
+  // the recorded id decides which grammar parses the file, so leaving it empty
+  // while printing a hint would show counters from the wrong grammar.
   const auto = follow({ path: 'run.log', runner: 'auto' })
-  assert.equal(real.get(auto.id).runner, null)
-  assert.match(real.get(auto.id).detectReason, /follow 不执行 runner/)
+  const autoRun = real.get(auto.id)
+  // Whatever it inferred (here: the newest run of the conversation), the record
+  // names it and says where it came from, so the grammar and the counters agree.
+  assert.ok(typeof autoRun.runner === 'string' && autoRun.runner !== '')
+  assert.match(autoRun.detectReason, /没有任何证据|最近一次运行|目录探测/)
 
-  // The historical call keeps the runner-less record it always had.
+  // A call that names no runner infers one too, with its reason: the parse
+  // grammar has to match the file, so "no runner" is no longer a valid record.
   const bare = follow({ path: 'run.log' })
-  assert.equal(real.get(bare.id).runner, null)
-  assert.equal(real.get(bare.id).detectReason, null)
+  const bareRun = real.get(bare.id)
+  assert.ok(typeof bareRun.runner === 'string' && bareRun.runner !== '')
+  assert.match(bareRun.detectReason, /没有任何证据|最近一次运行|目录探测/)
   real.dispose()
 })
