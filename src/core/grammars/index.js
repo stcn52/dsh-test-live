@@ -12,9 +12,10 @@ import { go } from './go.js'
 import { jest } from './jest.js'
 import { nodeTest } from './node-test.js'
 import { pytest } from './pytest.js'
+import { script } from './script.js'
 import { vitest } from './vitest.js'
 
-export const GRAMMARS = Object.freeze({ go, vitest, jest, nodeTest, pytest, generic })
+export const GRAMMARS = Object.freeze({ go, vitest, jest, nodeTest, pytest, script, generic })
 
 /** Spellings that must land on a grammar instead of the generic fallback. */
 const ALIASES = Object.freeze({
@@ -24,7 +25,6 @@ const ALIASES = Object.freeze({
   'go-test': 'go',
   golang: 'go',
   unknown: 'generic',
-  script: 'generic',
   command: 'generic',
 })
 

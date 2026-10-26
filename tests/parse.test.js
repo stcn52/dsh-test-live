@@ -11,7 +11,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
@@ -345,7 +345,7 @@ test('vitest and jest failures are test failures, not build errors', () => {
 
 test('an unknown runner only colours plain/panic/result and invents no counts', () => {
   const everyFixture = FIXTURES_TABLE.map(row => [row.dir, row.file])
-  for (const runnerId of ['generic', 'script', 'cargo', 'ruby']) {
+  for (const runnerId of ['generic', 'cargo', 'ruby']) {
     for (const [dir, file] of everyFixture) {
       const { summary, lines } = replay(dir, file, runnerId)
       assert.deepEqual(summaryCounts(summary), ZERO, `${runnerId} ${dir}/${file}: no counts`)
@@ -354,6 +354,32 @@ test('an unknown runner only colours plain/panic/result and invents no counts', 
       }
     }
   }
+})
+
+test('a package.json script is counted from the aggregate lines it prints', () => {
+  // `script` runs whatever package.json says, so it may print node --test, vitest,
+  // jest or pytest output. Its grammar only reads the aggregate sentences those
+  // tools share, and must land on the same test counters as the runner's own
+  // grammar for the same captured output.
+  const rows = []
+  for (const dir of readdirSync(FIXTURES)) {
+    const path = join(FIXTURES, dir)
+    if (!statSync(path).isDirectory()) continue
+    // `go test` prints none of the aggregate sentences a script shares; that is
+    // why a Go module detects as `go` in the first place.
+    if (dir === 'go') continue
+    for (const file of readdirSync(path).filter(name => name.endsWith('.txt'))) rows.push([dir, file])
+  }
+  assert.ok(rows.length >= 15, `fixture table too small: ${rows.length}`)
+  let counted = 0
+  for (const [dir, file] of rows) {
+    const native = dir === 'node-test' ? 'nodeTest' : dir
+    const ours = replay(dir, file, 'script').counts.tests
+    const theirs = replay(dir, file, native).counts.tests
+    assert.deepEqual(ours, theirs, `script grammar must agree with ${native} on ${dir}/${file}`)
+    if (ours.pass + ours.fail + ours.skip > 0) counted++
+  }
+  assert.ok(counted >= 15, `expected nearly every fixture to carry counts, got ${counted}`)
 })
 
 test('a generic summary prints no suite or test clause', () => {

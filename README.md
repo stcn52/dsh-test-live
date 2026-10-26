@@ -70,7 +70,7 @@ runner 的描述符集中在 `src/core/runners.js`：一个 id 决定可执行�
 | `jest` | `pnpm exec jest`；追加 `--verbose`、`-t=<pattern>`、目标 | dependencies/devDependencies 含 `jest` | 同上 | `verbose`（`--verbose`）；`-t` |
 | `nodeTest` | `node --test`；追加 `--test-reporter=spec`、`--test-name-pattern=<pattern>`、目标 | `package.json` 的 `scripts.test` 里出现 `node --test` | 相对文件或目录，如 `test/`、`test/math.test.js` | `verbose`（`--test-reporter=spec`）；`--test-name-pattern` |
 | `pytest` | `pytest`；追加 `-v`、`-k=<pattern>`、目标 | pytest 配置标记（`pytest.ini` / `pyproject.toml` / `setup.cfg` / `tox.ini` 任一），或目录、`tests/` 下的 `test_*.py` / `*_test.py` / `conftest.py` | 相对 nodeid，如 `tests/test_calc.py::test_add`、`tests/` | `verbose`（`-v`）；`-k` |
-| `script` | `pnpm test --`（执行 `package.json` 的 `scripts.test`），不追加任何东西 | `package.json` 存在，且 `allowScriptRunners: true`；关闭时回落 `generic` 并说明 | 目标会被忽略（不进 argv） | 无 |
+| `script` | `pnpm test --`（执行 `package.json` 的 `scripts.test`），不追加任何东西 | `package.json` 存在，且 `allowScriptRunners: true`；关闭时回落 `generic` 并说明 | 目标会被忽略（不进 argv） | 无（计数来自输出里的汇总行：node --test TAP/spec、vitest、jest、pytest、cargo 的「N passed/failed」句子；没有汇总行就一个数都不编） |
 | `generic` | 配置里的 `command + baseArgs`（默认 `go test`） | 以上都不匹配、`Cargo.toml`（cargo 未实现）、`script` 被关闭 | 目标会被忽略（不进 argv） | 无 |
 
 几个容易踩的点：
