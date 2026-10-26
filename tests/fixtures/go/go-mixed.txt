@@ -1,0 +1,3 @@
+ok  	pkg/one	0.1s
+FAIL	pkg/two	0.2s
+?	pkg/three	[no test files]

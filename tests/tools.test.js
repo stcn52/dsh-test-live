@@ -11,6 +11,21 @@ import { createHub } from '../src/core/runner.js'
 import { registerTools } from '../src/tools/index.js'
 
 /**
+ * Resolve the plugin config with persistence switched off.
+ *
+ * Without this the hub reads the host's real state file
+ * (`~/.dsh/test-live/runs.json`), so a run persisted by one test was restored by
+ * the next one and the "no test run yet" / "count" assertions answered with
+ * somebody else's history. Persistence itself is covered by
+ * tests/runner.test.js; the tool surface is tested against an in-memory registry.
+ * @param raw - plugin row config overrides.
+ * @returns frozen settings.
+ */
+function testConfig(raw = {}) {
+  return resolveConfig({ stateFile: null, ...raw })
+}
+
+/**
  * Build a fake spawn whose child stays running until `close` is called.
  * @returns {{ spawn: Function, last: () => object }}
  */
@@ -45,7 +60,7 @@ function collect(hub) {
 
 test('test_live_run returns at once and leaves the run streaming', async () => {
   const fake = fakeSpawn()
-  const hub = createHub(resolveConfig({}), { spawn: fake.spawn })
+  const hub = createHub(testConfig({}), { spawn: fake.spawn })
   const tools = collect(hub)
 
   const value = await tools.get('test_live_run').execute({ packages: ['./a'], count: true }, {})
@@ -60,7 +75,7 @@ test('test_live_run returns at once and leaves the run streaming', async () => {
 
 test('test_live_run with wait=true reports the finished run', async () => {
   const fake = fakeSpawn()
-  const hub = createHub(resolveConfig({}), { spawn: fake.spawn })
+  const hub = createHub(testConfig({}), { spawn: fake.spawn })
   const tools = collect(hub)
 
   const pending = tools.get('test_live_run').execute({ wait: true, waitSec: 5 }, {})
@@ -75,7 +90,7 @@ test('test_live_run with wait=true reports the finished run', async () => {
 
 test('cancelling the call stops the run it was waiting for', async () => {
   const fake = fakeSpawn()
-  const hub = createHub(resolveConfig({}), { spawn: fake.spawn })
+  const hub = createHub(testConfig({}), { spawn: fake.spawn })
   const tools = collect(hub)
   const controller = new AbortController()
 
@@ -94,7 +109,7 @@ test('cancelling the call stops the run it was waiting for', async () => {
 
 test('an exhausted wait budget does not kill a healthy run', async () => {
   const fake = fakeSpawn()
-  const hub = createHub(resolveConfig({}), { spawn: fake.spawn })
+  const hub = createHub(testConfig({}), { spawn: fake.spawn })
   const tools = collect(hub)
   // The wait timer is unref'd, so the test itself has to keep the loop alive long
   // enough for the 1s budget to elapse.
@@ -178,7 +193,7 @@ function execIn(sessionId) {
 
 test('test_live_run takes its conversation from the call, not the arguments', async () => {
   const fake = fakeSpawn()
-  const real = createHub(resolveConfig({}), { spawn: fake.spawn })
+  const real = createHub(testConfig({}), { spawn: fake.spawn })
   const { hub, calls } = spyHub(real)
   const tools = collectWith(hub, stubResolver())
 
@@ -201,7 +216,7 @@ test('test_live_run takes its conversation from the call, not the arguments', as
 
 test('test_live_run without a session context keeps the host-wide shape', async () => {
   const fake = fakeSpawn()
-  const real = createHub(resolveConfig({}), { spawn: fake.spawn })
+  const real = createHub(testConfig({}), { spawn: fake.spawn })
   const { hub, calls } = spyHub(real)
   const tools = collectWith(hub, stubResolver())
 
@@ -216,7 +231,7 @@ test('test_live_run without a session context keeps the host-wide shape', async 
 
 test('test_live_run degrades when the session resolver throws', async () => {
   const fake = fakeSpawn()
-  const real = createHub(resolveConfig({}), { spawn: fake.spawn })
+  const real = createHub(testConfig({}), { spawn: fake.spawn })
   const resolver = {
     describe() {
       throw new Error('session service is shutting down')
@@ -238,7 +253,7 @@ test('test_live_follow follows inside the conversation cwd', async () => {
   const sessionDir = await mkdtemp(join(tmpdir(), 'dsh-test-live-tool-'))
   await writeFile(join(sessionDir, 'run.log'), 'ok  \tpkg/a\t0.1s\n', 'utf8')
   const root = await mkdtemp(join(tmpdir(), 'dsh-test-live-root-'))
-  const real = createHub(resolveConfig({ followRoot: root, followIntervalMs: 100 }))
+  const real = createHub(testConfig({ followRoot: root, followIntervalMs: 100 }))
   const tools = collectWith(real, stubResolver({ s1: { sessionId: 's1', sessionLabel: '修复登录', cwd: sessionDir } }))
 
   // A relative path in a tool call means "inside this conversation", which the
@@ -255,7 +270,7 @@ test('test_live_follow follows inside the conversation cwd', async () => {
 test('test_live_follow still refuses a path outside every root', async () => {
   const sessionDir = await mkdtemp(join(tmpdir(), 'dsh-test-live-tool-'))
   const root = await mkdtemp(join(tmpdir(), 'dsh-test-live-root-'))
-  const real = createHub(resolveConfig({ followRoot: root }))
+  const real = createHub(testConfig({ followRoot: root }))
   const tools = collectWith(real, stubResolver({ s1: { sessionId: 's1', sessionLabel: '修复登录', cwd: sessionDir } }))
 
   await assert.rejects(
@@ -268,7 +283,7 @@ test('test_live_follow still refuses a path outside every root', async () => {
 
 test('test_live_runs lists every conversation, then one on request', async () => {
   const fake = fakeSpawn()
-  const real = createHub(resolveConfig({}), { spawn: fake.spawn })
+  const real = createHub(testConfig({}), { spawn: fake.spawn })
   const tools = collectWith(real, stubResolver())
 
   const first = await tools.get('test_live_run').execute({}, execIn('s1'))
@@ -292,7 +307,7 @@ test('test_live_runs lists every conversation, then one on request', async () =>
 
 test('test_live_runs appends the requested tail lines', async () => {
   const fake = fakeSpawn()
-  const real = createHub(resolveConfig({}), { spawn: fake.spawn })
+  const real = createHub(testConfig({}), { spawn: fake.spawn })
   const tools = collectWith(real, stubResolver())
 
   const value = await tools.get('test_live_run').execute({}, execIn('s1'))
@@ -306,7 +321,7 @@ test('test_live_runs appends the requested tail lines', async () => {
 })
 
 test('test_live_runs on an empty host says so instead of failing', () => {
-  const real = createHub(resolveConfig({}), { spawn: () => ({ on() {}, stdout: null, stderr: null }) })
+  const real = createHub(testConfig({}), { spawn: () => ({ on() {}, stdout: null, stderr: null }) })
   const tools = collectWith(real, stubResolver())
 
   const value = tools.get('test_live_runs').execute({})
@@ -317,7 +332,7 @@ test('test_live_runs on an empty host says so instead of failing', () => {
 
 test('test_live_status reads this conversation, not the newest run on the host', async () => {
   const fake = fakeSpawn()
-  const real = createHub(resolveConfig({}), { spawn: fake.spawn })
+  const real = createHub(testConfig({}), { spawn: fake.spawn })
   const tools = collectWith(real, stubResolver())
 
   const mine = await tools.get('test_live_run').execute({}, execIn('s1'))
@@ -334,7 +349,7 @@ test('test_live_status reads this conversation, not the newest run on the host',
 
 test('test_live_status without a session keeps the host-wide newest run', async () => {
   const fake = fakeSpawn()
-  const real = createHub(resolveConfig({}), { spawn: fake.spawn })
+  const real = createHub(testConfig({}), { spawn: fake.spawn })
   const tools = collectWith(real, stubResolver())
 
   await tools.get('test_live_run').execute({}, execIn('s1'))
@@ -347,7 +362,7 @@ test('test_live_status without a session keeps the host-wide newest run', async 
 
 test('test_live_status in a conversation without runs says so', async () => {
   const fake = fakeSpawn()
-  const real = createHub(resolveConfig({}), { spawn: fake.spawn })
+  const real = createHub(testConfig({}), { spawn: fake.spawn })
   const tools = collectWith(real, stubResolver())
 
   await tools.get('test_live_run').execute({}, execIn('s2'))
@@ -360,7 +375,7 @@ test('test_live_status in a conversation without runs says so', async () => {
 
 test('test_live_cancel only cancels a run of the calling conversation', async () => {
   const fake = fakeSpawn()
-  const real = createHub(resolveConfig({}), { spawn: fake.spawn })
+  const real = createHub(testConfig({}), { spawn: fake.spawn })
   const tools = collectWith(real, stubResolver())
 
   const mine = await tools.get('test_live_run').execute({}, execIn('s1'))
@@ -369,5 +384,151 @@ test('test_live_cancel only cancels a run of the calling conversation', async ()
   const value = tools.get('test_live_cancel').execute({}, execIn('s1'))
   assert.equal(value.id, mine.id)
   assert.equal(real.get(theirs.id).status, 'running', 'another conversation run must be untouched')
+  real.dispose()
+})
+
+// ---------------------------------------------------------------------------
+// Runner descriptors: the tool surface passes the caller's choice through and
+// reports which runner produced a run, without ever rebuilding the argv.
+// ---------------------------------------------------------------------------
+
+test('test_live_run advertises runner, targets and the legacy aliases', () => {
+  const real = createHub(testConfig({}), { spawn: () => ({ on() {}, stdout: null, stderr: null }) })
+  const tools = collectWith(real, stubResolver())
+  const params = tools.get('test_live_run').parameters.properties
+
+  assert.ok(params.runner, 'runner must be callable')
+  assert.ok(params.runner.enum.includes('auto'))
+  assert.ok(params.runner.enum.includes('pytest'))
+  assert.ok(params.targets, 'targets must be callable')
+  assert.ok(params.flags, 'flags must be callable')
+  // ADDED, not replacing: a model that still sends the Go-era arguments works.
+  assert.ok(params.packages)
+  assert.ok(params.verbose)
+  assert.ok(params.race)
+  assert.ok(params.count)
+  real.dispose()
+})
+
+test('test_live_run hands runner, targets and flags to the hub untouched', async () => {
+  const fake = fakeSpawn()
+  const real = createHub(testConfig({}), { spawn: fake.spawn })
+  const { hub, calls } = spyHub(real)
+  const tools = collectWith(hub, stubResolver())
+
+  const args = { runner: 'nodeTest', targets: ['test/'], flags: { verbose: true } }
+  const value = await tools.get('test_live_run').execute(args, {})
+
+  assert.equal(value.status, 'running')
+  assert.deepEqual(calls.start[0].options, args, 'the argv belongs to the runner, not to the tool surface')
+  assert.equal(real.get(value.id).runner, 'nodeTest')
+  real.dispose()
+})
+
+test('test_live_run refuses an unknown runner before spawning anything', async () => {
+  const fake = fakeSpawn()
+  const real = createHub(testConfig({}), { spawn: fake.spawn })
+  const tools = collectWith(real, stubResolver())
+
+  await assert.rejects(async () => tools.get('test_live_run').execute({ runner: 'cargo' }, {}), /unknown runner "cargo"/)
+  assert.equal(fake.last(), null, 'a refused call must not spawn')
+  assert.equal(real.list().length, 0)
+  real.dispose()
+})
+
+test('test_live_run refuses the script runner unless the host enabled it', async () => {
+  const gated = fakeSpawn()
+  const real = createHub(testConfig({}), { spawn: gated.spawn })
+  const tools = collectWith(real, stubResolver())
+
+  await assert.rejects(async () => tools.get('test_live_run').execute({ runner: 'script' }, {}), /allowScriptRunners/)
+  assert.equal(gated.last(), null)
+  real.dispose()
+
+  const open = fakeSpawn()
+  const allowedHub = createHub(testConfig({ allowScriptRunners: true }), { spawn: open.spawn })
+  const allowed = collectWith(allowedHub, stubResolver())
+  const value = await allowed.get('test_live_run').execute({ runner: 'script' }, {})
+
+  assert.equal(value.status, 'running')
+  assert.equal(allowedHub.get(value.id).runner, 'script')
+  allowedHub.dispose()
+})
+
+test('test_live_status names the runner that produced the run', async () => {
+  const fake = fakeSpawn()
+  const real = createHub(testConfig({}), { spawn: fake.spawn })
+  const tools = collectWith(real, stubResolver())
+
+  const started = await tools.get('test_live_run').execute({ runner: 'pytest', targets: ['tests/'] }, {})
+  fake.last().stdout.write('tests/test_calc.py::test_add PASSED\n')
+  fake.last().close(0, null)
+  await new Promise(resolve => setImmediate(resolve))
+
+  const value = tools.get('test_live_status').execute({ id: started.id }, {})
+  assert.match(value.text, /^runner: pytest$/m, 'the report must say which grammar produced the counters')
+  assert.match(value.text, /pytest tests\//, 'and the argv it ran')
+  real.dispose()
+})
+
+test('test_live_status is honest about a run from before runners existed', () => {
+  const legacy = {
+    id: 'run_old',
+    kind: 'command',
+    status: 'passed',
+    command: 'go',
+    args: ['test', './...'],
+    cwd: '/repo',
+    runner: null,
+    runnerLabel: null,
+    summaryText: '1 packages ok',
+  }
+  const tools = collectWith(
+    { latest: () => legacy, get: () => legacy, list: () => [legacy], linesSince: () => [], cancel: () => false },
+    stubResolver(),
+  )
+
+  const value = tools.get('test_live_status').execute({}, {})
+  assert.match(value.text, /^runner: not recorded$/m)
+})
+
+test('test_live_follow spells the write-with command for the current runner', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-test-live-tool-'))
+  await writeFile(join(dir, 'run.log'), 'ok\n', 'utf8')
+  const real = createHub(testConfig({ followRoot: dir, followIntervalMs: 100 }))
+  const tools = collectWith(real, stubResolver())
+  const follow = args => tools.get('test_live_follow').execute(args, {})
+
+  // No runner named and no run yet: the historical Go wording is unchanged.
+  const historical = follow({ path: 'run.log' })
+  assert.match(historical.text, /^write with: go test \.\/\.\.\. 2>&1 \| tee /m)
+
+  const pytest = follow({ path: 'run.log', runner: 'pytest' })
+  assert.equal(pytest.runner, 'pytest')
+  assert.match(pytest.text, /^write with: pytest -v 2>&1 \| tee /m)
+
+  const vitest = follow({ path: 'run.log', runner: 'vitest' })
+  assert.match(vitest.text, /^write with: pnpm exec vitest run 2>&1 \| tee /m)
+
+  const go = follow({ path: 'run.log', runner: 'go' })
+  assert.match(go.text, /^runner: go$/m)
+
+  // A typo fails here instead of producing a hint for a runner that cannot parse.
+  assert.throws(() => follow({ path: 'run.log', runner: 'cargo' }), /unknown runner "cargo"/)
+  real.dispose()
+})
+
+test('test_live_follow follows the runner of the newest run of the conversation', async () => {
+  const fake = fakeSpawn()
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-test-live-tool-'))
+  await writeFile(join(dir, 'run.log'), 'ok\n', 'utf8')
+  const real = createHub(testConfig({ followRoot: dir, followIntervalMs: 100 }), { spawn: fake.spawn })
+  const tools = collectWith(real, stubResolver({ s1: { sessionId: 's1', sessionLabel: '修复登录', cwd: dir } }))
+
+  await tools.get('test_live_run').execute({ runner: 'nodeTest' }, execIn('s1'))
+  const value = tools.get('test_live_follow').execute({ path: 'run.log' }, execIn('s1'))
+
+  assert.equal(value.runner, 'nodeTest')
+  assert.match(value.text, /^write with: node --test 2>&1 \| tee /m)
   real.dispose()
 })

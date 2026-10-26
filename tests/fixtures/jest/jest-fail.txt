@@ -1,0 +1,26 @@
+FAIL tests/fail.test.js
+  calc add
+    ✕ fails on purpose (3 ms)
+
+  ● calc add › fails on purpose
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 4
+    Received: 3
+
+      3 | describe('calc add', () => {
+      4 |   test('fails on purpose', () => {
+    > 5 |     expect(add(1, 2)).toBe(4)
+        |                       ^
+      6 |   })
+      7 | })
+      8 |
+
+      at Object.toBe (tests/fail.test.js:5:23)
+
+Test Suites: 1 failed, 1 total
+Tests:       1 failed, 1 total
+Snapshots:   0 total
+Time:        0.242 s
+Ran all test suites matching tests/fail.test.js.

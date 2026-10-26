@@ -1,0 +1,4 @@
+=== RUN   TestB
+--- FAIL: TestB (0.01s)
+FAIL
+FAIL	github.com/x/y	0.456s

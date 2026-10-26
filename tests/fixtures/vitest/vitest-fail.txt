@@ -1,0 +1,35 @@
+
+ RUN  v5.0.5 /tmp/lang-fixtures/vitest
+
+ ❯ tests/fail.test.js (2 tests | 1 failed) 7ms
+   ❯ calc add (2)
+     ✓ adds two numbers 2ms
+     × fails on purpose 4ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  tests/fail.test.js > calc add > fails on purpose
+AssertionError: expected 3 to be 4 // Object.is equality
+
+- Expected
++ Received
+
+- 4
++ 3
+
+ ❯ tests/fail.test.js:9:23
+      7|   })
+      8|   it('fails on purpose', () => {
+      9|     expect(add(1, 2)).toBe(4)
+       |                       ^
+     10|   })
+     11| })
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 1 passed (2)
+   Start at  17:50:53
+   Duration  156ms (transform 43%, import 24%, tests 23%, worker 9%)
+

@@ -224,6 +224,16 @@ function buttonByText(tree, label) {
   return matches[0]
 }
 
+/** The <option> children of one <select>. */
+function optionsOf(select) {
+  return (select.children || []).filter((node) => node.type === 'option')
+}
+
+/** The one node carrying `data-role`, or undefined. */
+function byRole(tree, role) {
+  return findAll(tree, (node) => node.props['data-role'] === role)[0]
+}
+
 // ---------------------------------------------------------------------------
 // Fake browser: window, document, localStorage, EventSource, fetch.
 // ---------------------------------------------------------------------------
@@ -299,6 +309,8 @@ function createServer(options = {}) {
     runs: options.runs || ALL_RUNS,
     sessions: options.sessions === undefined ? SESSIONS : options.sessions,
     defaultScope: options.defaultScope || 'all',
+    // null = the pre-runner host: GET /runners is not a route at all (404).
+    runners: options.runners === undefined ? null : options.runners,
     fail: Boolean(options.fail),
     gets: [],
     posts: [],
@@ -313,6 +325,10 @@ function createServer(options = {}) {
       const body = init.body ? JSON.parse(init.body) : null
       world.posts.push({ path: url.pathname, body })
       if (url.pathname === '/test-live/run') {
+        // Echo what the host would resolve: `auto` becomes a concrete runner,
+        // and `detectReason` is the marker a run was detected, not picked.
+        const asked = body && body.runner ? body.runner : null
+        const resolved = asked === 'auto' ? 'go' : asked
         return ok({
           ...RUN_A1,
           id: 'run_new1',
@@ -320,6 +336,9 @@ function createServer(options = {}) {
           durationMs: undefined,
           startedAt: Date.now(),
           summary: null,
+          runner: resolved || undefined,
+          runnerLabel: resolved ? 'Go 测试' : undefined,
+          detectReason: resolved && asked === 'auto' ? 'go.mod' : undefined,
           sessionId: body && body.sessionId ? body.sessionId : null,
         })
       }
@@ -339,6 +358,10 @@ function createServer(options = {}) {
     }
     world.gets.push({ path: url.pathname, query: url.search })
     if (world.fail) return bad(500, '宿主未响应')
+    if (url.pathname === '/test-live/runners') {
+      if (world.runners === null) return bad(404, 'unknown route /test-live/runners')
+      return ok(world.runners)
+    }
     if (url.pathname !== '/test-live/runs') return bad(404, `unknown route ${url.pathname}`)
     const scope = url.searchParams.get('scope') === 'session' ? 'session' : 'all'
     const sessionId = url.searchParams.get('sessionId')
@@ -356,6 +379,15 @@ function createServer(options = {}) {
 function useServer(world) {
   globalThis.fetch = (url, init) => world.handle(url, init)
   return world
+}
+
+/**
+ * The newest GET of one path. The panel probes /runners besides the run list,
+ * so "the last request" is not the same thing as "the last run-list request".
+ */
+function lastGet(world, path = '/test-live/runs') {
+  const hits = world.gets.filter((entry) => entry.path === path)
+  return hits[hits.length - 1]
 }
 
 // ---------------------------------------------------------------------------
@@ -487,7 +519,7 @@ test('默认 scope=all：两个对话的 3 条 run 全部列出，切「本对�
   buttonByText(tree, '本对话').props.onClick()
   tree = await panel.settle()
 
-  const sessionFetch = world.gets[world.gets.length - 1]
+  const sessionFetch = lastGet(world)
   assert.match(sessionFetch.query, /[?&]scope=session/)
   assert.match(sessionFetch.query, new RegExp('[?&]sessionId=' + INJECTED_SESSION))
 
@@ -515,7 +547,7 @@ test('下拉选某个对话：按该对话取数，第二行/落盘都跟着走'
   select.props.onChange({ target: { value: 'ses_bbbb2222' } })
   tree = await panel.settle()
 
-  const fetch = world.gets[world.gets.length - 1]
+  const fetch = lastGet(world)
   assert.match(fetch.query, /[?&]scope=session/)
   assert.match(fetch.query, /[?&]sessionId=ses_bbbb2222/)
   assert.equal(byClass(tree, 'dtl-run').length, 2, 'the picked conversation has two runs')
@@ -622,7 +654,7 @@ test('首屏没有存储偏好时采用响应里的 defaultScope', async () => {
 
   const tree = await panel.settle()
 
-  const last = world.gets[world.gets.length - 1]
+  const last = lastGet(world)
   assert.match(last.query, /[?&]scope=session/, 'the host default view is adopted on first screen')
   assert.match(last.query, new RegExp('sessionId=' + INJECTED_SESSION))
   assert.equal(byClass(tree, 'dtl-run').length, 1)
@@ -637,6 +669,446 @@ test('已存储的 scope 优先于 defaultScope', async () => {
 
   const tree = await panel.settle()
 
-  assert.match(world.gets[world.gets.length - 1].query, /[?&]scope=all/)
+  assert.match(lastGet(world).query, /[?&]scope=all/)
   assert.equal(byClass(tree, 'dtl-run').length, 3)
+})
+
+// ---------------------------------------------------------------------------
+// Runner descriptors.
+//
+// The fixtures mirror what host-api2 serves from runnerCatalog(): a deliberately
+// small projection (id, label, language, selectionPlaceholder, flags, labels,
+// available, reason). `selection.mode` and `separator` are optional extras, so
+// both spellings are exercised below.
+// ---------------------------------------------------------------------------
+
+/** A vitest run: new `suites` bucket, its own runner, file-oriented labels. */
+const RUN_V1 = {
+  id: 'run_v1',
+  status: 'passed',
+  kind: 'test',
+  command: 'pnpm',
+  args: ['exec', 'vitest', 'run', 'tests/'],
+  cwd: '/home/chenyang/opt/dsh-test-live',
+  sessionId: 'ses_aaaa1111',
+  sessionLabel: '重构 runner',
+  durationMs: 900,
+  lastSeq: 7,
+  truncated: false,
+  runner: 'vitest',
+  runnerLabel: 'Vitest',
+  summary: {
+    suites: { ok: ['tests/a.test.js', 'tests/b.test.js'], fail: [], noTest: [] },
+    tests: { pass: 4, fail: 0, skip: 0 },
+    buildErrors: [],
+  },
+}
+
+const RUNNERS = {
+  defaultRunner: 'auto',
+  allowScriptRunners: false,
+  runners: [
+    {
+      id: 'go',
+      label: 'Go 测试',
+      language: 'go',
+      selectionPlaceholder: './...',
+      flags: [
+        { id: 'verbose', label: '-v', argv: ['-v'], default: true },
+        { id: 'race', label: '-race', argv: ['-race'] },
+        { id: 'count', label: '-count=1', argv: ['-count=1'] },
+      ],
+      labels: { suite: '包' },
+      available: true,
+    },
+    {
+      id: 'vitest',
+      label: 'Vitest',
+      language: 'javascript',
+      selectionPlaceholder: 'tests/',
+      hint: '逗号分隔，写 tests/ 下的文件路径',
+      flags: [{ id: 'verbose', label: '--reporter=verbose', argv: ['--reporter=verbose'], default: true }],
+      labels: { suite: '文件' },
+      available: true,
+    },
+    {
+      id: 'pytest',
+      label: 'pytest',
+      language: 'python',
+      selectionPlaceholder: 'tests/',
+      hint: '支持 path::test 与 -k 模式',
+      flags: [{ id: 'verbose', label: '-v', argv: ['-v'], default: true }],
+      labels: { suite: '用例' },
+      available: false,
+      reason: 'python3 不在 PATH',
+    },
+    {
+      id: 'script',
+      label: 'npm script',
+      language: 'javascript',
+      // No target syntax at all: the panel must hide the whole target row.
+      selectionMode: 'none',
+      selectionPlaceholder: null,
+      flags: [],
+      labels: { suite: '用例' },
+      available: false,
+      reason: '未开启 allowScriptRunners',
+    },
+  ],
+}
+
+/** The same catalogue with the script runner allowed and used as the default. */
+const SCRIPT_RUNNERS = {
+  defaultRunner: 'script',
+  allowScriptRunners: true,
+  runners: [
+    {
+      id: 'script',
+      label: 'npm script',
+      language: 'javascript',
+      selection: { mode: 'none' },
+      flags: [],
+      labels: { suite: '用例' },
+      available: true,
+    },
+  ],
+}
+
+/** A runner whose descriptor forgot `labels`: the pre-runner wording must survive. */
+const NO_LABELS_RUNNERS = {
+  defaultRunner: 'vitest',
+  runners: [
+    {
+      id: 'vitest',
+      label: 'Vitest',
+      language: 'javascript',
+      selectionPlaceholder: 'tests/',
+      flags: [],
+      available: true,
+    },
+  ],
+}
+
+/** defaultRunner is a concrete runner, and its separator is a semicolon. */
+const GO_SEMI_RUNNERS = {
+  defaultRunner: 'go',
+  runners: [
+    {
+      id: 'go',
+      label: 'Go 测试',
+      language: 'go',
+      selectionPlaceholder: './...',
+      separator: ';',
+      flags: [{ id: 'verbose', label: '-v', argv: ['-v'], default: true }],
+      labels: { suite: '包' },
+      available: true,
+    },
+  ],
+}
+
+test('降级一：旧宿主没有 /runners，面板保持旧布局，POST 仍只发旧字段', async () => {
+  resetStorage()
+  // No `runners` option: GET /runners is a 404, exactly like today's host.
+  const world = useServer(createServer())
+  const panel = createPanel({ sessionId: INJECTED_SESSION })
+  let tree = await panel.settle()
+
+  assert.ok(world.gets.some((entry) => entry.path === '/test-live/runners'), 'the panel probes /runners')
+  assert.equal(byRole(tree, 'runner'), undefined, 'no runner dropdown without a catalogue')
+  assert.equal(findAll(tree, (node) => node.props['data-flag']).length, 0, 'no descriptor flags without a catalogue')
+  // the pre-runner controls are all still there
+  assert.equal(byRole(tree, 'targets').props.placeholder, './...')
+  assert.ok(textOf(tree).includes('-v'), 'the hardcoded -v checkbox survives')
+  assert.equal(byClass(tree, 'dtl-error').length, 0, 'a missing /runners is not an error for the user')
+  assert.equal(byClass(tree, 'dtl-run').length, 3, 'the run list still loads')
+
+  buttonByText(tree, '运行').props.onClick()
+  tree = await panel.settle()
+  const post = world.posts.find((entry) => entry.path === '/test-live/run')
+  // Byte-for-byte the old body: no runner, no flags, no targets.
+  assert.deepEqual(post.body, { packages: ['./...'], verbose: true, sessionId: INJECTED_SESSION })
+})
+
+test('降级一之二：runners 为空数组时同样退回旧布局', async () => {
+  resetStorage()
+  const world = useServer(createServer({ runners: [] }))
+  const panel = createPanel({ sessionId: INJECTED_SESSION })
+  const tree = await panel.settle()
+
+  assert.ok(world.gets.some((entry) => entry.path === '/test-live/runners'))
+  assert.equal(byRole(tree, 'runner'), undefined, 'an empty catalogue is the same non-event as a 404')
+  assert.equal(byRole(tree, 'targets').props.placeholder, './...')
+  assert.equal(findAll(tree, (node) => node.type === 'select').length, 1, 'only the conversation dropdown remains')
+})
+
+test('runner 下拉：自动识别默认选中，available:false 置灰带原因，选择落 localStorage', async () => {
+  resetStorage()
+  useServer(createServer({ runners: RUNNERS }))
+  const panel = createPanel({ sessionId: INJECTED_SESSION })
+  let tree = await panel.settle()
+
+  const select = byRole(tree, 'runner')
+  assert.ok(select, 'the dropdown renders once the host serves /runners')
+  assert.equal(select.props.value, 'auto', 'defaultRunner=auto selects 自动识别')
+  assert.deepEqual(optionsOf(select).map(textOf), ['自动识别', 'Go 测试', 'Vitest', 'pytest', 'npm script'])
+
+  const options = optionsOf(select)
+  assert.equal(options[1].props.disabled, false, 'an available runner is not disabled')
+  const pytest = options.find((option) => option.props.value === 'pytest')
+  assert.equal(pytest.props.disabled, true, 'available:false is greyed out')
+  assert.equal(pytest.props.title, 'python3 不在 PATH', 'the reason goes into the title')
+  const script = options.find((option) => option.props.value === 'script')
+  assert.equal(script.props.disabled, true)
+  assert.equal(script.props.title, '未开启 allowScriptRunners')
+
+  // the conversation dropdown coexists with the runner one
+  assert.equal(findAll(tree, (node) => node.type === 'select').length, 2)
+
+  // picking a runner persists it
+  select.props.onChange({ target: { value: 'vitest' } })
+  tree = await panel.settle()
+  assert.equal(byRole(tree, 'runner').props.value, 'vitest')
+  assert.equal(JSON.parse(storage.get('dsh-test-live:runner')), 'vitest', 'the choice survives a reload')
+
+  // a stored choice the host now marks unavailable falls back instead of wedging
+  storage.set('dsh-test-live:runner', JSON.stringify('pytest'))
+  const panel2 = createPanel({ sessionId: INJECTED_SESSION })
+  const tree2 = await panel2.settle()
+  assert.equal(byRole(tree2, 'runner').props.value, 'auto', 'an unavailable stored runner falls back to 自动识别')
+})
+
+test('切到 vitest：placeholder/hint、描述符 flags、labels 文案与 POST body 全跟着换', async () => {
+  resetStorage()
+  const world = useServer(createServer({ runners: RUNNERS, runs: [RUN_V1, ...ALL_RUNS] }))
+  const panel = createPanel({ sessionId: INJECTED_SESSION })
+  let tree = await panel.settle()
+
+  // --- per-run labels: the vitest run counts 文件, the legacy runs still count 包
+  const chips = byClass(tree, 'dtl-run').map(textOf)
+  assert.ok(chips.some((text) => /通过 · 2 文件/.test(text)), 'the vitest chip speaks 文件, saw: ' + JSON.stringify(chips))
+  assert.ok(chips.some((text) => /通过 · 3 包/.test(text)), 'runs without a runner keep the 包 wording')
+  // the open run is the newest one: its footnote and meta follow its own runner
+  assert.ok(textOf(tree).includes('文件：2 通过'), 'the footnote is labelled 文件')
+  assert.ok(textOf(tree).includes('runner：Vitest'))
+
+  // --- switch to vitest
+  byRole(tree, 'runner').props.onChange({ target: { value: 'vitest' } })
+  tree = await panel.settle()
+
+  const input = byRole(tree, 'targets')
+  assert.equal(input.props.placeholder, 'tests/', 'placeholder comes from the descriptor')
+  assert.equal(input.props.title, '逗号分隔，写 tests/ 下的文件路径', 'the hint becomes the input title')
+  assert.ok(textOf(tree).includes('逗号分隔，写 tests/ 下的文件路径'), 'the hint is visible, not just a tooltip')
+
+  const boxes = findAll(tree, (node) => node.props['data-flag'])
+  assert.deepEqual(boxes.map((box) => box.props['data-flag']), ['verbose'], 'flags come from the descriptor')
+  assert.equal(boxes[0].props.checked, true, 'the default comes from flag.default')
+  assert.equal(textOf(tree).includes('-race'), false, "another runner's flags do not leak in")
+
+  // --- POST body
+  input.props.onChange({ target: { value: 'tests/a.test.js, tests/b.test.js' } })
+  tree = await panel.settle()
+  buttonByText(tree, '运行').props.onClick()
+  tree = await panel.settle()
+
+  const post = world.posts.find((entry) => entry.path === '/test-live/run')
+  assert.deepEqual(post.body, {
+    runner: 'vitest',
+    flags: { verbose: true },
+    verbose: true,
+    sessionId: INJECTED_SESSION,
+    targets: ['tests/a.test.js', 'tests/b.test.js'],
+  }, 'the descriptor shape, with the legacy verbose boolean kept')
+  assert.equal(post.body.packages, undefined, 'the old packages field is not sent in runner mode')
+})
+
+test('selection.mode=none：整行目标输入隐藏，follow 行保留，提交照样带 runner', async () => {
+  resetStorage()
+  const world = useServer(createServer({ runners: SCRIPT_RUNNERS, runs: [] }))
+  const panel = createPanel({ sessionId: INJECTED_SESSION })
+  let tree = await panel.settle()
+
+  assert.equal(byRole(tree, 'runner').props.value, 'script', 'defaultRunner names a concrete runner')
+  assert.equal(byRole(tree, 'targets'), undefined, 'a runner without target syntax has no target input')
+  assert.equal(byRole(tree, 'targets-row'), undefined, 'the whole row is gone')
+  // ...but the follow row is not
+  assert.ok(byRole(tree, 'follow-row'), 'the follow row survives')
+  assert.ok(byRole(tree, 'follow'), 'the follow input survives')
+
+  // the empty state suggests this runner's command, without a placeholder target
+  const empty = byClass(tree, 'dtl-empty').map(textOf).join('\n')
+  assert.ok(empty.includes('pnpm test'), 'the example command follows the runner: ' + empty)
+  assert.equal(empty.includes('./...'), false, 'no invented Go pattern for a script runner')
+
+  buttonByText(tree, '运行').props.onClick()
+  tree = await panel.settle()
+  const post = world.posts.find((entry) => entry.path === '/test-live/run')
+  assert.deepEqual(post.body, { runner: 'script', flags: {}, verbose: true, sessionId: INJECTED_SESSION })
+  assert.equal('targets' in post.body, false, 'no targets means "the runner default", so the key is omitted')
+})
+
+test('labels 缺失：回落「包」文案，且新 suites 桶与旧 packages 桶都能读', async () => {
+  resetStorage()
+  useServer(createServer({ runners: NO_LABELS_RUNNERS, runs: [RUN_V1, ...ALL_RUNS] }))
+  const panel = createPanel({ sessionId: INJECTED_SESSION })
+  const tree = await panel.settle()
+
+  assert.equal(byRole(tree, 'runner').props.value, 'vitest', 'defaultRunner wins when it is a concrete id')
+  const chips = byClass(tree, 'dtl-run').map(textOf)
+  assert.ok(chips.some((text) => /通过 · 2 包/.test(text)), 'summary.suites is read even without a runner label')
+  assert.ok(chips.some((text) => /通过 · 3 包/.test(text)), 'the legacy summary.packages bucket still renders')
+  assert.ok(textOf(tree).includes('包：2 通过'), 'a missing labels.suite falls back to 包')
+})
+
+test('auto 跑完：meta 显示本次实际用的 runner', async () => {
+  resetStorage()
+  const world = useServer(createServer({ runners: RUNNERS }))
+  const panel = createPanel({ sessionId: INJECTED_SESSION })
+  let tree = await panel.settle()
+
+  buttonByText(tree, '运行').props.onClick()
+  tree = await panel.settle()
+
+  const post = world.posts.find((entry) => entry.path === '/test-live/run')
+  assert.deepEqual(post.body, { runner: 'auto', flags: {}, verbose: true, sessionId: INJECTED_SESSION })
+
+  const meta = byClass(tree, 'dtl-meta').map(textOf).join('\n')
+  assert.ok(meta.includes('runner：自动识别 → Go 测试'), 'the resolved runner is shown: ' + meta)
+})
+
+test('defaultRunner=go 与分号分隔符：目标按描述符切分，verbose 勾选映射进 flags', async () => {
+  resetStorage()
+  const world = useServer(createServer({ runners: GO_SEMI_RUNNERS }))
+  const panel = createPanel({ sessionId: INJECTED_SESSION })
+  let tree = await panel.settle()
+
+  assert.equal(byRole(tree, 'runner').props.value, 'go', 'defaultRunner=go is selected, not 自动识别')
+  const input = byRole(tree, 'targets')
+  input.props.onChange({ target: { value: './a/...; ./b/...' } })
+  tree = await panel.settle()
+  buttonByText(tree, '运行').props.onClick()
+  tree = await panel.settle()
+
+  const first = world.posts.find((entry) => entry.path === '/test-live/run')
+  assert.deepEqual(first.body.targets, ['./a/...', './b/...'], "targets split on the descriptor's separator")
+  assert.deepEqual(first.body.flags, { verbose: true }, 'flags carry explicit booleans per descriptor flag')
+  assert.equal(first.body.verbose, true)
+
+  // unchecking the descriptor flag must reach both the body and the old pref key
+  const box = findAll(tree, (node) => node.props['data-flag'] === 'verbose')[0]
+  box.props.onChange({ target: { checked: false } })
+  tree = await panel.settle()
+  assert.equal(findAll(tree, (node) => node.props['data-flag'] === 'verbose')[0].props.checked, false)
+  assert.equal(JSON.parse(storage.get('dsh-test-live:verbose')), false, 'the old -v preference is kept in sync')
+
+  // a fresh panel starts from that stored preference, so flags is empty
+  const panel2 = createPanel({ sessionId: INJECTED_SESSION })
+  tree = await panel2.settle()
+  assert.equal(findAll(tree, (node) => node.props['data-flag'] === 'verbose')[0].props.checked, false, 'flag.default is overridden by the stored -v choice')
+  buttonByText(tree, '运行').props.onClick()
+  tree = await panel2.settle()
+  const second = world.posts.filter((entry) => entry.path === '/test-live/run')[1]
+  assert.deepEqual(second.body.flags, { verbose: false }, 'an unchecked flag is sent as false, not dropped')
+  assert.equal(second.body.verbose, false)
+})
+
+/** A runner the client has no command prefix for: `generic` uses config.command. */
+const GENERIC_RUNNERS = {
+  defaultRunner: 'generic',
+  runners: [
+    { id: 'generic', label: '自定义命令', language: 'other', selection: { mode: 'none' }, flags: [], labels: { suite: '用例' }, available: true },
+  ],
+}
+
+test('generic：空态不编造命令，也不留空 code', async () => {
+  resetStorage()
+  useServer(createServer({ runners: GENERIC_RUNNERS, runs: [] }))
+  const panel = createPanel({ sessionId: INJECTED_SESSION })
+  const tree = await panel.settle()
+
+  assert.equal(byRole(tree, 'runner').props.value, 'generic')
+  const empty = byClass(tree, 'dtl-empty').map(textOf).join('\n')
+  assert.ok(empty.includes('自定义命令 的默认命令'), 'a runner without a known prefix gets a neutral phrase: ' + empty)
+  assert.equal(empty.includes('go test'), false, 'the client does not invent a Go command for generic')
+  // no empty <code> element
+  const codes = findAll(tree, (node) => node.type === 'code').map(textOf)
+  assert.deepEqual(codes, ['test_live_run'], 'only the real command reference is a code span: ' + JSON.stringify(codes))
+})
+
+test('吃真实投影：用 src/core/runners.js 的 runnerCatalog() 渲染，字段名对得上', async () => {
+  // The fixtures above are hand-written from the contract. This test feeds the
+  // panel the catalogue the host actually serves, so a renamed projection field
+  // (`selectionHint`, `mode`, `labels.suite`) breaks here instead of in the GUI.
+  let runnerCatalog
+  try {
+    ;({ runnerCatalog } = await import(new URL('../src/core/runners.js', import.meta.url).href))
+  } catch (error) {
+    assert.fail('cannot import src/core/runners.js (owned by runner-core): ' + error.message)
+  }
+  const real = runnerCatalog({ allowScriptRunners: false })
+  assert.ok(Array.isArray(real) && real.length > 0, 'runnerCatalog() must return a non-empty list')
+
+  resetStorage()
+  const world = useServer(createServer({
+    runners: { runners: real, defaultRunner: 'auto', allowScriptRunners: false },
+    runs: [RUN_V1, ...ALL_RUNS],
+  }))
+  const panel = createPanel({ sessionId: INJECTED_SESSION })
+  let tree = await panel.settle()
+
+  // the picker is the real catalogue, in its own order, behind 自动识别
+  const select = byRole(tree, 'runner')
+  assert.deepEqual(
+    optionsOf(select).map((option) => option.props.value),
+    ['auto'].concat(real.map((entry) => entry.id)),
+  )
+  assert.deepEqual(
+    optionsOf(select).slice(1).map(textOf),
+    real.map((entry) => entry.label),
+    'the option text is the host label',
+  )
+
+  // `available:false` from the real catalogue is greyed with the real reason
+  const scriptEntry = real.find((entry) => entry.id === 'script')
+  if (scriptEntry) {
+    const option = optionsOf(select).find((node) => node.props.value === 'script')
+    assert.equal(option.props.disabled, scriptEntry.available === false)
+    assert.equal(option.props.title, String(scriptEntry.reason))
+  }
+
+  // a real `files` runner: placeholder + selectionHint (not the command hint)
+  byRole(tree, 'runner').props.onChange({ target: { value: 'vitest' } })
+  tree = await panel.settle()
+  const vitest = real.find((entry) => entry.id === 'vitest')
+  const input = byRole(tree, 'targets')
+  assert.equal(input.props.placeholder, vitest.selectionPlaceholder)
+  assert.ok(typeof vitest.selectionHint === 'string' && vitest.selectionHint !== '',
+    'the projection must carry selectionHint — this is the field the target row reads')
+  assert.ok(textOf(tree).includes(vitest.selectionHint), 'the target row shows selectionHint, not the command hint')
+  if (vitest.hint && vitest.hint !== vitest.selectionHint) {
+    assert.equal(
+      findAll(tree, (node) => node.className === 'dtl-note')
+        .some((node) => textOf(node) === vitest.hint),
+      false,
+      'the command hint must not be pasted next to the target input',
+    )
+  }
+
+  // a real `none` runner hides the target row
+  const noneRunner = real.find((entry) => entry.mode === 'none' && entry.available !== false)
+  assert.ok(noneRunner, 'the catalogue is expected to have an available mode:none runner')
+  if (noneRunner) {
+    byRole(tree, 'runner').props.onChange({ target: { value: noneRunner.id } })
+    tree = await panel.settle()
+    assert.equal(byRole(tree, 'targets'), undefined, 'mode:none hides the target input for ' + noneRunner.id)
+    assert.ok(byRole(tree, 'follow-row'), 'the follow row survives')
+  }
+
+  // and the POST body keeps the real flag ids
+  buttonByText(tree, '运行').props.onClick()
+  tree = await panel.settle()
+  const post = world.posts.filter((entry) => entry.path === '/test-live/run').pop()
+  assert.equal(typeof post.body.runner, 'string')
+  assert.equal(typeof post.body.flags, 'object', 'flags is the {flagId: boolean} object the route accepts')
+  assert.equal(Array.isArray(post.body.flags), false, 'an array of ids would be refused by the route')
 })

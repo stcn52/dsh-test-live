@@ -7,6 +7,20 @@ import test from 'node:test'
 import { resolveConfig } from '../src/core/config.js'
 import { createHub, resolveFollowPath } from '../src/core/runner.js'
 
+/**
+ * Resolve the plugin config with persistence switched off.
+ *
+ * A hub disposed by one test wrote its runs into the host's real state file
+ * (`~/.dsh/test-live/runs.json`) and the next test's hub restored them, so
+ * `hub.list().length` was not what the test itself created. Persistence is
+ * tests/runner.test.js's subject; the follow reader is tested in memory.
+ * @param raw - plugin row config overrides.
+ * @returns frozen settings.
+ */
+function testConfig(raw = {}) {
+  return resolveConfig({ stateFile: null, ...raw })
+}
+
 /** Poll a predicate until it holds or the budget expires. */
 async function waitFor(predicate, timeoutMs = 3000) {
   const started = Date.now()
@@ -18,7 +32,7 @@ async function waitFor(predicate, timeoutMs = 3000) {
 }
 
 test('resolveFollowPath keeps paths inside the root', () => {
-  const settings = resolveConfig({ followRoot: '/srv/project' })
+  const settings = testConfig({ followRoot: '/srv/project' })
   assert.equal(resolveFollowPath('run.log', settings), '/srv/project/run.log')
   assert.equal(resolveFollowPath('/srv/project/sub/run.log', settings), '/srv/project/sub/run.log')
   assert.throws(() => resolveFollowPath('../etc/passwd', settings), /outside/)
@@ -31,14 +45,17 @@ test('follow streams appended lines and folds the summary', async () => {
   const file = join(dir, 'run.log')
   await writeFile(file, '=== RUN   TestA\nok  \tpkg/a\t0.1s\n', 'utf8')
 
-  const hub = createHub(resolveConfig({ followRoot: dir, followIntervalMs: 100 }))
+  const hub = createHub(testConfig({ followRoot: dir, followIntervalMs: 100 }))
   const meta = hub.follow('run.log')
   assert.equal(meta.kind, 'file')
   assert.equal(meta.status, 'running')
 
   assert.ok(await waitFor(() => hub.linesSince(meta.id, -1).length >= 2))
   const first = hub.get(meta.id)
-  assert.deepEqual(first.summary.packages.ok, ['pkg/a'])
+  // CHANGED (runner descriptors): the `packages` bucket is `suites` now; the old
+  // name survives only as a non-enumerable alias for pre-rename readers, and the
+  // HTTP payload/state file carry `suites` only.
+  assert.deepEqual(first.summary.suites.ok, ['pkg/a'])
 
   await appendFile(file, '--- FAIL: TestB (0.01s)\n', 'utf8')
   assert.ok(await waitFor(() => hub.linesSince(meta.id, -1).length >= 3))
@@ -57,7 +74,7 @@ test('follow notices truncation and re-reads from the start', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-test-live-'))
   const file = join(dir, 'run.log')
   await writeFile(file, 'first line\n', 'utf8')
-  const hub = createHub(resolveConfig({ followRoot: dir, followIntervalMs: 100 }))
+  const hub = createHub(testConfig({ followRoot: dir, followIntervalMs: 100 }))
   const meta = hub.follow('run.log')
   assert.ok(await waitFor(() => hub.linesSince(meta.id, -1).length >= 1))
 
@@ -72,7 +89,7 @@ test('follow notices truncation and re-reads from the start', async () => {
 
 test('follow waits for the file to appear (tail -F semantics)', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-test-live-'))
-  const hub = createHub(resolveConfig({ followRoot: dir, followIntervalMs: 100 }))
+  const hub = createHub(testConfig({ followRoot: dir, followIntervalMs: 100 }))
   const meta = hub.follow('later.log')
   assert.ok(await waitFor(() => hub.linesSince(meta.id, -1).some(entry => entry.text.includes('waiting for'))))
   assert.equal(hub.get(meta.id).status, 'running')
@@ -86,7 +103,7 @@ test('follow waits for the file to appear (tail -F semantics)', async () => {
 
 test('follow fails the run when the path is not readable as a file', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-test-live-'))
-  const hub = createHub(resolveConfig({ followRoot: dir, followIntervalMs: 100 }))
+  const hub = createHub(testConfig({ followRoot: dir, followIntervalMs: 100 }))
   // A directory stats fine but cannot be read as a log: EISDIR takes the failure path.
   const meta = hub.follow('.')
   assert.ok(await waitFor(() => hub.get(meta.id).status === 'failed'))
@@ -97,7 +114,7 @@ test('follow fails the run when the path is not readable as a file', async () =>
 
 test('follow is refused outside the configured root', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-test-live-'))
-  const hub = createHub(resolveConfig({ followRoot: dir }))
+  const hub = createHub(testConfig({ followRoot: dir }))
   assert.throws(() => hub.follow('../../etc/passwd'), /outside/)
   hub.dispose()
 })
@@ -106,7 +123,7 @@ test('dispose stops a running follow', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-test-live-'))
   const file = join(dir, 'run.log')
   await writeFile(file, 'x\n', 'utf8')
-  const hub = createHub(resolveConfig({ followRoot: dir, followIntervalMs: 100 }))
+  const hub = createHub(testConfig({ followRoot: dir, followIntervalMs: 100 }))
   const meta = hub.follow('run.log')
   hub.dispose()
   assert.equal(hub.get(meta.id).status, 'canceled')
@@ -121,7 +138,7 @@ test('a conversation adds its own cwd to the follow roots', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-test-live-root-'))
   const sessionDir = await mkdtemp(join(tmpdir(), 'dsh-test-live-session-'))
   await writeFile(join(sessionDir, 'run.log'), 'ok  \tpkg/a\t0.1s\n', 'utf8')
-  const hub = createHub(resolveConfig({ followRoot: root, followIntervalMs: 100 }))
+  const hub = createHub(testConfig({ followRoot: root, followIntervalMs: 100 }))
   const context = { sessionId: 's1', sessionLabel: '修复登录', cwd: sessionDir, origin: 'panel' }
 
   const roots = hub.followRootsFor(context)
@@ -139,7 +156,7 @@ test('a conversation adds its own cwd to the follow roots', async () => {
 
 test('the widened roots change nothing without a context', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-test-live-root-'))
-  const hub = createHub(resolveConfig({ followRoot: root }))
+  const hub = createHub(testConfig({ followRoot: root }))
   assert.deepEqual(hub.followRootsFor(undefined), hub.roots())
   assert.deepEqual(hub.followRootsFor({}), hub.roots())
   hub.dispose()
@@ -148,7 +165,7 @@ test('the widened roots change nothing without a context', async () => {
 test('a conversation cannot follow outside every root', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-test-live-root-'))
   const sessionDir = await mkdtemp(join(tmpdir(), 'dsh-test-live-session-'))
-  const hub = createHub(resolveConfig({ followRoot: root }))
+  const hub = createHub(testConfig({ followRoot: root }))
   const context = { sessionId: 's1', sessionLabel: '修复登录', cwd: sessionDir, origin: 'panel' }
 
   // The wording is what the panel's error box shows and what the routes turn
@@ -163,7 +180,7 @@ test('a conversation cannot follow outside every root', async () => {
 test('a follow without a context records no conversation', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-test-live-'))
   await writeFile(join(dir, 'run.log'), 'x\n', 'utf8')
-  const hub = createHub(resolveConfig({ followRoot: dir, followIntervalMs: 100 }))
+  const hub = createHub(testConfig({ followRoot: dir, followIntervalMs: 100 }))
   const meta = hub.follow('run.log')
   assert.equal(meta.sessionId, null)
   assert.equal(meta.sessionLabel, null)

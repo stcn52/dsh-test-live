@@ -19,8 +19,9 @@ import { spawn as nodeSpawn } from 'node:child_process'
 import { lstatSync, realpathSync } from 'node:fs'
 import { open, stat } from 'node:fs/promises'
 import { basename, dirname, join, resolve, sep } from 'node:path'
-import { buildArgs, normalizeRunOptions } from './config.js'
-import { classifyLine, createSummary, deriveStatus, observeLine, summarize } from './parse.js'
+import { assertPattern, assertTargets, normalizeRunOptions } from './config.js'
+import { classifyLine, createSummary, deriveStatus, migrateSummary, observeLine, summarize } from './parse.js'
+import { RUNNERS, buildRunArgv, detectRunner, runnerCatalog } from './runners.js'
 import { createRunStore } from './store.js'
 
 /** Synthetic line emitted when the child cannot even start. */
@@ -321,6 +322,11 @@ export function createHub(settings, deps = {}) {
     while (runs.has(id)) id = makeRunId()
     return {
       kind: 'command',
+      // Which runner descriptor produced the argv, why it was chosen, and the
+      // label the panel shows. A file-follow run has no runner (null).
+      runner: null,
+      runnerLabel: null,
+      detectReason: null,
       status: 'running',
       command: settings.command,
       args: [],
@@ -345,7 +351,7 @@ export function createHub(settings, deps = {}) {
       seq: 0,
       carry: '',
       provisional: null,
-      summary: createSummary(),
+      summary: createSummary(textOrNull(input.runner)),
       listeners: new Set(),
       child: null,
       timer: null,
@@ -402,6 +408,22 @@ export function createHub(settings, deps = {}) {
   }
 
   /**
+   * The runner a stored record came from.
+   *
+   * Records written before descriptors existed carry no `runner`; the plugin
+   * then only ever ran `go test` or one configured command, so the command line
+   * itself still identifies the runner well enough for the summary labels.
+   * @param record - stored run record.
+   * @returns a runner id, or null for a followed file.
+   */
+  function legacyRunnerFor(record) {
+    if (record.kind === 'file') return null
+    const command = typeof record.command === 'string' ? record.command : ''
+    const args = Array.isArray(record.args) ? record.args.map(String) : []
+    return /(^|\/)go(\.exe)?$/.test(command) && args[0] === 'test' ? 'go' : 'generic'
+  }
+
+  /**
    * Rebuild one run from a stored record.
    *
    * A run that was `running` when the host died is reported as `canceled` with
@@ -415,32 +437,28 @@ export function createHub(settings, deps = {}) {
     const wasRunning = record.status === 'running'
     const status = wasRunning ? 'canceled' : STORED_STATUSES.has(record.status) ? record.status : 'failed'
     const finishedAt = wasRunning ? now() : typeof record.finishedAt === 'number' ? record.finishedAt : null
+    const runner = textOrNull(record.runner) ?? legacyRunnerFor(record)
     const lines = []
     if (Array.isArray(record.lines)) {
       for (const entry of record.lines) {
         if (entry === null || typeof entry !== 'object') continue
         const seq = Number.isInteger(entry.seq) && entry.seq > 0 ? entry.seq : lines.length + 1
         const text = typeof entry.text === 'string' ? entry.text : String(entry.text ?? '')
-        lines.push({ seq, text, kind: textOrNull(entry.kind) ?? classifyLine(text), provisional: false })
+        lines.push({ seq, text, kind: textOrNull(entry.kind) ?? classifyLine(text, runner), provisional: false })
       }
     }
     const lastSeq = Number.isInteger(record.lastSeq) ? record.lastSeq : lines.length > 0 ? lines[lines.length - 1].seq : 0
-    const fresh = createSummary()
-    const stored = record.summary !== null && typeof record.summary === 'object' ? record.summary : null
-    const summary =
-      stored === null
-        ? fresh
-        : {
-            tests: { ...fresh.tests, ...(stored.tests ?? {}) },
-            packages: { ...fresh.packages, ...(stored.packages ?? {}) },
-            failures: Array.isArray(stored.failures) ? stored.failures.slice() : fresh.failures,
-            buildErrors: Array.isArray(stored.buildErrors) ? stored.buildErrors.slice() : fresh.buildErrors,
-            coverage: Array.isArray(stored.coverage) ? stored.coverage.slice() : fresh.coverage,
-          }
+    // The parser owns the rename `packages` -> `suites` and the hidden index
+    // rebuild, so history is migrated by its one compatibility function rather
+    // than by a second copy of that logic here.
+    const summary = migrateSummary(record.summary, runner)
     return baseRun({
       id: record.id,
       kind: record.kind === 'file' ? 'file' : 'command',
       file: textOrNull(record.file),
+      runner,
+      runnerLabel: textOrNull(record.runnerLabel) ?? (runner === null ? null : RUNNERS[runner]?.label ?? null),
+      detectReason: textOrNull(record.detectReason),
       status,
       command: typeof record.command === 'string' ? record.command : settings.command,
       args: Array.isArray(record.args) ? record.args.map(String) : [],
@@ -483,6 +501,55 @@ export function createHub(settings, deps = {}) {
   }
 
   /**
+   * Resolve which runner executes a run.
+   *
+   * Precedence: the request's own id, then the deployment's configured id, and
+   * only when that is `'auto'` does detection look at the directory the child
+   * will run in. Detection is never allowed to override an explicit runner.
+   * @param requested - the run option's runner (null, `'auto'`, or an id).
+   * @param cwd - directory the child will be spawned in.
+   * @returns `{ id, reason, descriptor }`; `reason` is the detection reason.
+   */
+  function resolveRunner(requested, cwd) {
+    if (requested !== null && requested !== 'auto') {
+      return { id: requested, reason: null, descriptor: RUNNERS[requested] }
+    }
+    const configured = typeof settings.runner === 'string' ? settings.runner : 'go'
+    if (requested === null && configured !== 'auto') {
+      const descriptor = RUNNERS[configured] ?? RUNNERS.generic
+      return { id: descriptor.id, reason: null, descriptor }
+    }
+    const detected = detectRunner(cwd, { allowScriptRunners: settings.allowScriptRunners })
+    return {
+      id: detected.id,
+      reason: detected.reason,
+      descriptor: RUNNERS[detected.id] ?? RUNNERS.generic,
+    }
+  }
+
+  /**
+   * The executable and the leading arguments of one run.
+   *
+   * `generic` uses the deployment's `command`/`baseArgs` verbatim, and so does a
+   * legacy Go deployment (`kind: 'go-test'`) — that row is where an absolute
+   * binary path such as `/usr/local/go/bin/go` is configured, and a descriptor
+   * must not silently replace it with a bare name. Every other runner brings its
+   * own executable.
+   * @param runnerId - resolved runner id.
+   * @param descriptor - its descriptor.
+   * @returns `{ command, baseArgs }`.
+   */
+  function commandLineFor(runnerId, descriptor) {
+    if (descriptor.executable === null || runnerId === 'generic') {
+      return { command: settings.command, baseArgs: settings.baseArgs.slice() }
+    }
+    if (runnerId === 'go' && settings.kind === 'go-test') {
+      return { command: settings.command, baseArgs: settings.baseArgs.slice() }
+    }
+    return { command: descriptor.executable, baseArgs: descriptor.baseArgs.slice() }
+  }
+
+  /**
    * Register a run and start its child process.
    * @param options - raw run options from HTTP or a tool.
    * @param context - run ownership from the session resolver.
@@ -491,21 +558,50 @@ export function createHub(settings, deps = {}) {
   function start(options, context) {
     const normalizedOptions = normalizeRunOptions(options, settings)
     const owner = normalizeContext(context)
+    const cwd = spawnCwd(owner)
+    const resolved = resolveRunner(normalizedOptions.runner, cwd)
+    if (resolved.descriptor.scriptRunner === true && settings.allowScriptRunners !== true) {
+      // Refuse before a run is registered or a child spawned: the script runner
+      // delegates to the project's own test script, so the deployment has to opt
+      // into running code this plugin does not control.
+      throw new Error(
+        'runner "script" 需要 allowScriptRunners: true（在插件配置里打开后才会执行 package.json 的 test 脚本）',
+      )
+    }
+    const targets = normalizedOptions.targetsExplicit
+      ? normalizedOptions.targets
+      : resolved.descriptor.selection.default.slice()
+    // `auto` could only be shape-checked at request time, so validate against
+    // the descriptor that actually resolved, before anything is spawned.
+    assertTargets(resolved.descriptor, targets)
+    assertPattern(resolved.descriptor, normalizedOptions.pattern)
+    const { command, baseArgs } = commandLineFor(resolved.id, resolved.descriptor)
     const run = createRun({
       // `...owner` first: its `cwd` is the *session's* directory, which
       // `spawnCwd` may well have rejected (relative) or overridden.
       ...owner,
       kind: 'command',
-      command: settings.command,
-      args: [...settings.baseArgs, ...buildArgs(normalizedOptions, settings.kind)],
-      cwd: spawnCwd(owner),
+      runner: resolved.id,
+      runnerLabel: resolved.descriptor.label,
+      detectReason: resolved.reason,
+      command,
+      args: [
+        ...baseArgs,
+        ...buildRunArgv(resolved.descriptor, {
+          targets,
+          pattern: normalizedOptions.pattern,
+          flags: normalizedOptions.flags,
+          timeoutSec: normalizedOptions.timeoutSec,
+        }),
+      ],
+      cwd,
       timeoutSec: normalizedOptions.timeoutSec,
     })
 
     let child
     const detached = process.platform !== 'win32'
     try {
-      child = spawn(settings.command, run.args, {
+      child = spawn(run.command, run.args, {
         cwd: run.cwd,
         env: { ...process.env, ...settings.env, FORCE_COLOR: '0', NO_COLOR: '1' },
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -561,9 +657,9 @@ export function createHub(settings, deps = {}) {
       const entry = run.provisional
       run.provisional = null
       entry.text = text
-      entry.kind = classifyLine(text)
+      entry.kind = classifyLine(text, run.runner)
       entry.provisional = false
-      observeLine(run.summary, text)
+      observeLine(run.summary, text, run.runner)
       notifyLine(run, entry)
       return
     }
@@ -578,7 +674,7 @@ export function createHub(settings, deps = {}) {
   function partialLine(run, text) {
     if (run.provisional !== null) {
       run.provisional.text = text
-      run.provisional.kind = classifyLine(text)
+      run.provisional.kind = classifyLine(text, run.runner)
       notifyLine(run, run.provisional)
       return
     }
@@ -593,8 +689,8 @@ export function createHub(settings, deps = {}) {
    */
   function pushNewLine(run, text, provisional) {
     run.seq++
-    const entry = { seq: run.seq, text, kind: classifyLine(text), provisional }
-    if (!provisional) observeLine(run.summary, text)
+    const entry = { seq: run.seq, text, kind: classifyLine(text, run.runner), provisional }
+    if (!provisional) observeLine(run.summary, text, run.runner)
     run.lines.push(entry)
     if (run.lines.length > settings.maxLines) {
       run.lines.splice(0, run.lines.length - settings.maxLines)
@@ -635,7 +731,7 @@ export function createHub(settings, deps = {}) {
     }
     run.finishedAt = now()
     run.durationMs = run.finishedAt - run.startedAt
-    run.status = deriveStatus(run.exitCode, run.canceled, run.timedOut, run.summary)
+    run.status = deriveStatus(run.exitCode, run.canceled, run.timedOut, run.summary, run.runner)
     clearTimer(run)
     notifyStatus(run)
     persist()
@@ -1010,8 +1106,14 @@ export function createHub(settings, deps = {}) {
       truncated: run.truncated,
       buffered: run.lines.length,
       lastSeq: run.seq,
+      // Which runner produced this run, the label the panel shows, and (for a
+      // detected runner) the reason detection chose it.
+      runner: run.runner,
+      runnerLabel: run.runnerLabel,
+      detectReason: run.detectReason,
       summary: run.summary,
-      coverage: run.summary.coverage,
+      // A parser may predate the coverage bucket; the meta keeps working then.
+      coverage: Array.isArray(run.summary?.coverage) ? run.summary.coverage : [],
     }
     meta.summaryText = summarize(meta)
     return meta
@@ -1065,5 +1167,9 @@ export function createHub(settings, deps = {}) {
     persist,
     // The panel's opening scope, read by the routes as `hub.defaultScope`.
     defaultScope: settings.defaultScope === 'session' ? 'session' : 'all',
+    // The resolved config and the runner catalog, so the HTTP layer can serve
+    // `GET /test-live/runners` without reaching around the hub.
+    settings,
+    runners: () => runnerCatalog({ allowScriptRunners: settings.allowScriptRunners }),
   }
 }

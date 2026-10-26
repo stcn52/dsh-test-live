@@ -9,6 +9,22 @@ import { createHub } from '../src/core/runner.js'
 import { registerRoutes } from '../src/host/routes.js'
 
 /**
+ * Resolve the plugin config with persistence switched off.
+ *
+ * The suite used to run against the host's real state file
+ * (`~/.dsh/test-live/runs.json`): a hub that one test disposed wrote its runs
+ * there, the next test's hub restored them, and `/runs` then answered with a
+ * history the test never created — a refusal test saw one run too many and
+ * `runs` was no longer `[]`. These are routing tests; persistence is covered by
+ * tests/runner.test.js, so the registry stays in memory here.
+ * @param raw - plugin row config overrides.
+ * @returns frozen settings.
+ */
+function testConfig(raw = {}) {
+  return resolveConfig({ stateFile: null, ...raw })
+}
+
+/**
  * Build a fake cordis context that records injection scopes.
  * @returns {{ ctx: object, scopes: Array<object> }}
  */
@@ -84,7 +100,7 @@ function fakeRequest(method, url) {
 
 test('routes mount through an injection scope, not a name lookup', () => {
   const { ctx, scopes } = fakeContext()
-  const hub = createHub(resolveConfig({}), { spawn: () => ({ on() {}, stdout: null, stderr: null }) })
+  const hub = createHub(testConfig({}), { spawn: () => ({ on() {}, stdout: null, stderr: null }) })
 
   assert.equal(registerRoutes(ctx, hub), true)
   assert.equal(scopes.length, 1)
@@ -99,7 +115,7 @@ test('routes mount through an injection scope, not a name lookup', () => {
 
 test('the mounted prefix answers /test-live/runs with JSON', async () => {
   const { ctx, scopes } = fakeContext()
-  const hub = createHub(resolveConfig({}), { spawn: () => ({ on() {}, stdout: null, stderr: null }) })
+  const hub = createHub(testConfig({}), { spawn: () => ({ on() {}, stdout: null, stderr: null }) })
   registerRoutes(ctx, hub)
   const [route] = enterScope(scopes[0])
 
@@ -121,7 +137,7 @@ test('the mounted prefix answers /test-live/runs with JSON', async () => {
 })
 
 test('a missing injection API is reported instead of throwing', () => {
-  const hub = createHub(resolveConfig({}), { spawn: () => ({ on() {}, stdout: null, stderr: null }) })
+  const hub = createHub(testConfig({}), { spawn: () => ({ on() {}, stdout: null, stderr: null }) })
   assert.equal(registerRoutes({}, hub), false)
 })
 
@@ -147,7 +163,7 @@ test('POST /test-live/follow starts a file run', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-test-live-route-'))
   await writeFile(join(dir, 'run.log'), 'hello\n', 'utf8')
   const { ctx, scopes } = fakeContext()
-  const hub = createHub(resolveConfig({ followRoot: dir, followIntervalMs: 100 }))
+  const hub = createHub(testConfig({ followRoot: dir, followIntervalMs: 100 }))
   registerRoutes(ctx, hub)
   const [route] = enterScope(scopes[0])
 
@@ -166,7 +182,7 @@ test('POST /test-live/follow starts a file run', async () => {
 test('POST /test-live/follow refuses a path outside the root', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-test-live-route-'))
   const { ctx, scopes } = fakeContext()
-  const hub = createHub(resolveConfig({ followRoot: dir }))
+  const hub = createHub(testConfig({ followRoot: dir }))
   registerRoutes(ctx, hub)
   const [route] = enterScope(scopes[0])
 
@@ -182,7 +198,7 @@ test('POST /test-live/follow refuses a path outside the root', async () => {
 
 test('GET /test-live/follow requires POST', async () => {
   const { ctx, scopes } = fakeContext()
-  const hub = createHub(resolveConfig({}))
+  const hub = createHub(testConfig({}))
   registerRoutes(ctx, hub)
   const [route] = enterScope(scopes[0])
 
@@ -559,7 +575,7 @@ test('POST /follow keeps an explicit root but never widens it', async () => {
 test('a conversation does not widen the follow roots enough to escape every root', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-test-live-route-'))
   const { ctx, scopes } = fakeContext()
-  const hub = createHub(resolveConfig({ followRoot: dir }))
+  const hub = createHub(testConfig({ followRoot: dir }))
   registerRoutes(ctx, hub, stubResolver())
   const [route] = enterScope(scopes[0])
 
@@ -575,12 +591,12 @@ test('a conversation does not widen the follow roots enough to escape every root
   hub.dispose()
 })
 
-test('follow accepts a log inside the conversation cwd', { skip: typeof createHub(resolveConfig({})).followRootsFor !== 'function' ? 'host-core: followRootsFor 未落地' : false }, async () => {
+test('follow accepts a log inside the conversation cwd', { skip: typeof createHub(testConfig({})).followRootsFor !== 'function' ? 'host-core: followRootsFor 未落地' : false }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-test-live-root-'))
   const sessionDir = await mkdtemp(join(tmpdir(), 'dsh-test-live-session-'))
   await writeFile(join(sessionDir, 'run.log'), 'ok\n', 'utf8')
   const { ctx, scopes } = fakeContext()
-  const hub = createHub(resolveConfig({ followRoot: root, followIntervalMs: 100 }))
+  const hub = createHub(testConfig({ followRoot: root, followIntervalMs: 100 }))
   registerRoutes(ctx, hub, stubResolver({ s1: { sessionId: 's1', sessionLabel: '修复登录', cwd: sessionDir } }))
   const [route] = enterScope(scopes[0])
 
@@ -635,4 +651,187 @@ test('POST /cancel scopes its fallback to the named conversation', async () => {
 
   assert.equal(res.statusCode, 409, 'the stub never cancels anything')
   assert.deepEqual(hub.calls.cancel, ['run_s1'])
+})
+
+// ---------------------------------------------------------------------------
+// Runner descriptors.
+//
+// The routes publish the catalog and refuse a request the descriptor could never
+// express, but they never build the argv: the options are handed to the hub
+// verbatim, which is what keeps a pre-runner client byte-identical and what the
+// assertions below pin down.
+// ---------------------------------------------------------------------------
+
+/**
+ * A hub stub that also carries the runner settings a host exposes.
+ * @param options - {runs, defaultScope, roots, allowScriptRunners, defaultRunner}.
+ * @returns the stub hub.
+ */
+function runnerStubHub(options = {}) {
+  const hub = stubHub(options.runs ?? [], options)
+  hub.allowScriptRunners = options.allowScriptRunners === true
+  hub.defaultRunner = options.defaultRunner ?? 'auto'
+  return hub
+}
+
+test('GET /runners publishes the catalog, the default runner and the script gate', async () => {
+  const hub = runnerStubHub({ allowScriptRunners: true, defaultRunner: 'pytest' })
+  const route = mountStub(hub, stubResolver())
+
+  const res = await callRoute(route, 'GET', '/test-live/runners')
+
+  assert.equal(res.statusCode, 200)
+  const payload = JSON.parse(res.body())
+  assert.equal(payload.defaultRunner, 'pytest')
+  assert.equal(payload.allowScriptRunners, true)
+  const ids = payload.runners.map(runner => runner.id)
+  for (const id of ['go', 'vitest', 'jest', 'nodeTest', 'pytest', 'script', 'generic']) {
+    assert.ok(ids.includes(id), `the catalog must list ${id}`)
+  }
+  // cargo is deliberately absent: no binary on the proven machines, so a
+  // descriptor would be untested guesswork (contract v2).
+  assert.equal(ids.includes('cargo'), false)
+  const go = payload.runners.find(runner => runner.id === 'go')
+  assert.equal(go.selectionPlaceholder, './...')
+  assert.ok(Array.isArray(go.flags) && go.flags.some(flag => flag.id === 'race'))
+  assert.equal(payload.runners.find(runner => runner.id === 'script').available, true)
+})
+
+test('GET /runners marks the script runner unavailable without the switch', async () => {
+  const hub = runnerStubHub({ allowScriptRunners: false })
+  const payload = JSON.parse((await callRoute(mountStub(hub, stubResolver()), 'GET', '/test-live/runners')).body())
+
+  assert.equal(payload.allowScriptRunners, false)
+  assert.equal(payload.defaultRunner, 'auto')
+  const script = payload.runners.find(runner => runner.id === 'script')
+  assert.equal(script.available, false)
+  assert.match(script.reason, /allowScriptRunners/, 'the panel greys it out with a reason')
+})
+
+test('GET /runners requires GET', async () => {
+  const route = mountStub(runnerStubHub(), stubResolver())
+  assert.equal((await callRoute(route, 'POST', '/test-live/runners', {})).statusCode, 405)
+})
+
+test('POST /run hands runner, targets and flags to the hub untouched', async () => {
+  const hub = runnerStubHub()
+  const route = mountStub(hub, stubResolver())
+  const body = { runner: 'vitest', targets: ['tests/'], flags: { verbose: true }, pattern: 'calc add' }
+
+  const res = await callRoute(route, 'POST', '/test-live/run', body)
+
+  assert.equal(res.statusCode, 202)
+  // CHANGED for runners: the routes validate, the runner builds the argv, so the
+  // options must arrive unchanged. Rewriting them here would make the runner's
+  // own normalization (and the historical Go argv) unverifiable.
+  assert.deepEqual(hub.calls.start[0].options, body)
+})
+
+test('POST /run refuses an unknown runner without starting anything', async () => {
+  const hub = runnerStubHub()
+  const route = mountStub(hub, stubResolver())
+
+  const res = await callRoute(route, 'POST', '/test-live/run', { runner: 'cargo' })
+
+  assert.equal(res.statusCode, 400)
+  assert.match(JSON.parse(res.body()).error, /unknown runner "cargo"/)
+  assert.match(JSON.parse(res.body()).error, /go, vitest, jest, nodeTest, pytest, script, generic, auto/)
+  assert.equal(hub.calls.start.length, 0, 'a refused request must not spawn')
+})
+
+test('POST /run refuses the script runner unless the host enabled it', async () => {
+  const gated = runnerStubHub({ allowScriptRunners: false })
+  const refused = await callRoute(mountStub(gated, stubResolver()), 'POST', '/test-live/run', { runner: 'script' })
+
+  assert.equal(refused.statusCode, 400)
+  assert.match(JSON.parse(refused.body()).error, /allowScriptRunners/)
+  assert.equal(gated.calls.start.length, 0)
+
+  const open = runnerStubHub({ allowScriptRunners: true })
+  const allowed = await callRoute(mountStub(open, stubResolver()), 'POST', '/test-live/run', { runner: 'script' })
+
+  assert.equal(allowed.statusCode, 202)
+  assert.equal(open.calls.start.length, 1)
+})
+
+test('POST /run validates targets with the runner the caller named', async () => {
+  const hub = runnerStubHub()
+  const route = mountStub(hub, stubResolver())
+
+  const absolute = await callRoute(route, 'POST', '/test-live/run', { runner: 'go', targets: ['/etc/passwd'] })
+  assert.equal(absolute.statusCode, 400)
+  assert.match(JSON.parse(absolute.body()).error, /package pattern "\/etc\/passwd" is not allowed for runner "go"/)
+  assert.match(JSON.parse(absolute.body()).error, /\.\/\.\.\./, 'the refusal says what a valid target looks like')
+
+  const spaced = await callRoute(route, 'POST', '/test-live/run', { runner: 'go', targets: ['./calc add'] })
+  assert.equal(spaced.statusCode, 400, 'a Go package pattern cannot carry a space')
+
+  const globs = await callRoute(route, 'POST', '/test-live/run', { runner: 'go', targets: ['./...', './database/kdb'] })
+  assert.equal(globs.statusCode, 202)
+
+  // pytest node ids carry `::` and `[]`, and its -k filter takes spaces.
+  const pytest = await callRoute(route, 'POST', '/test-live/run', {
+    runner: 'pytest',
+    targets: ['tests/test_calc.py::TestAdd[1]', 'tests/[test_b]*.py'],
+    pattern: 'calc add',
+  })
+  assert.equal(pytest.statusCode, 202)
+
+  const vitest = await callRoute(route, 'POST', '/test-live/run', { runner: 'vitest', targets: ['tests/unit/'] })
+  assert.equal(vitest.statusCode, 202)
+  const absoluteFile = await callRoute(route, 'POST', '/test-live/run', { runner: 'vitest', targets: ['/tmp/x.test.js'] })
+  assert.equal(absoluteFile.statusCode, 400)
+})
+
+test('POST /run validates the name filter with the runner the caller named', async () => {
+  const hub = runnerStubHub()
+  const route = mountStub(hub, stubResolver())
+
+  // Go's -run regex has never accepted a space; vitest/jest/pytest -t/-k do.
+  const goSpaced = await callRoute(route, 'POST', '/test-live/run', { runner: 'go', pattern: 'Test Add' })
+  assert.equal(goSpaced.statusCode, 400)
+  assert.match(JSON.parse(goSpaced.body()).error, /test name pattern "Test Add" is not allowed for runner "go"/)
+
+  assert.equal((await callRoute(route, 'POST', '/test-live/run', { runner: 'go', pattern: 'TestApply' })).statusCode, 202)
+  assert.equal((await callRoute(route, 'POST', '/test-live/run', { runner: 'pytest', pattern: 'calc add' })).statusCode, 202)
+  assert.equal((await callRoute(route, 'POST', '/test-live/run', { runner: 'vitest', pattern: 'calc add' })).statusCode, 202)
+})
+
+test('POST /run refuses a flag the named runner does not have', async () => {
+  const hub = runnerStubHub()
+  const route = mountStub(hub, stubResolver())
+
+  const unknown = await callRoute(route, 'POST', '/test-live/run', { runner: 'vitest', flags: { race: true } })
+  assert.equal(unknown.statusCode, 400)
+  assert.match(JSON.parse(unknown.body()).error, /unknown flag "race" for runner "vitest"/)
+  assert.match(JSON.parse(unknown.body()).error, /available: verbose/)
+
+  const notBoolean = await callRoute(route, 'POST', '/test-live/run', { runner: 'go', flags: { race: 'yes' } })
+  assert.equal(notBoolean.statusCode, 400)
+  assert.match(JSON.parse(notBoolean.body()).error, /must be true or false/)
+
+  const known = await callRoute(route, 'POST', '/test-live/run', { runner: 'go', flags: { race: true, verbose: true } })
+  assert.equal(known.statusCode, 202)
+
+  // script/generic take no flags at all.
+  const empty = runnerStubHub({ allowScriptRunners: true })
+  const nothing = await callRoute(mountStub(empty, stubResolver()), 'POST', '/test-live/run', {
+    runner: 'script',
+    flags: { verbose: true },
+  })
+  assert.equal(nothing.statusCode, 400)
+  assert.match(JSON.parse(nothing.body()).error, /takes no flags/)
+})
+
+test('a pre-runner call still reaches the hub with the historical shape', async () => {
+  const hub = runnerStubHub()
+  const route = mountStub(hub, stubResolver())
+
+  const res = await callRoute(route, 'POST', '/test-live/run', { packages: ['./a'], verbose: true })
+
+  assert.equal(res.statusCode, 202)
+  // Unchanged from before runners existed: no runner key is added, the legacy
+  // field names survive untouched, and the routes do not validate them with the
+  // Go descriptor (the hub resolves `auto` at spawn time).
+  assert.deepEqual(hub.calls.start[0].options, { packages: ['./a'], verbose: true })
 })

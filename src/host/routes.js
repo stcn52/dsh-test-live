@@ -7,6 +7,7 @@
  *   GET  /test-live/runs                recent runs, newest first
  *                                       ?scope=all|session&sessionId=…&limit=…
  *   GET  /test-live/sessions            conversations that own runs + defaultScope
+ *   GET  /test-live/runners             runner descriptors + the host's default runner
  *   GET  /test-live/roots               configured follow roots + run cwd
  *   GET  /test-live/status?id=…         one run's meta (latest when id is absent)
  *   POST /test-live/run                 start a run (JSON options) → 202 + meta
@@ -27,8 +28,19 @@
 
 import { isAbsolute, resolve, sep } from 'node:path'
 
+import { RUNNERS, runnerCatalog } from '../core/runners.js'
+
 /** Route prefix claimed by this plugin. */
 export const ROUTE_PREFIX = '/test-live'
+
+/**
+ * The runner value meaning "detect it from the project".
+ *
+ * It is not a descriptor id: `RUNNERS` holds the concrete runners only, and the
+ * detection happens where the run is spawned, when the working directory is
+ * known.
+ */
+export const AUTO_RUNNER = 'auto'
 
 /** Scope value meaning "every conversation on this host". */
 const SCOPE_ALL = 'all'
@@ -286,6 +298,199 @@ function targetId(hub, url) {
 /** Upper bound for a JSON request body; the panel sends a few dozen bytes. */
 const MAX_BODY_BYTES = 64 * 1024
 
+/**
+ * The runner settings of a host.
+ *
+ * The plugin row config owns the default runner and the script-runner switch,
+ * but `registerRoutes` only receives the hub, so they are read off it — with two
+ * fallbacks, because the panel must keep working against a hub that does not
+ * expose them (an older core, a test stub): the historical answer is "auto" and
+ * "no script runner", which is exactly the Go-only behaviour of before.
+ * @param hub - run registry.
+ * @returns {{allowScriptRunners: boolean, defaultRunner: string}}
+ */
+function runnerSettings(hub) {
+  let allowScriptRunners = false
+  for (const value of [hub?.allowScriptRunners, hub?.settings?.allowScriptRunners]) {
+    if (typeof value === 'boolean') {
+      allowScriptRunners = value
+      break
+    }
+  }
+  const defaultRunner = trimId(hub?.defaultRunner) ?? trimId(hub?.settings?.runner) ?? AUTO_RUNNER
+  return { allowScriptRunners, defaultRunner }
+}
+
+/**
+ * The runner catalog, or an empty list when the core cannot describe itself.
+ *
+ * The hub's own `runners()` is preferred (it is the catalog the spawn path
+ * actually uses, built from the resolved settings); the module-level
+ * `runnerCatalog` keeps a hub without that method — an older core, a test stub —
+ * answering the same shape.
+ * @param hub - run registry.
+ * @param allowScriptRunners - whether the script runner is enabled on this host.
+ * @returns {Array<object>} catalog rows.
+ */
+function runnerList(hub, allowScriptRunners) {
+  try {
+    const list = typeof hub?.runners === 'function' ? hub.runners() : runnerCatalog({ allowScriptRunners })
+    return Array.isArray(list) ? list : []
+  } catch {
+    return []
+  }
+}
+
+/**
+ * What one selection entry is called for a runner, so the 400 reads like the
+ * runner's own documentation ("package pattern" for Go, "file pattern" for
+ * vitest, "test id" for pytest).
+ * @param descriptor - runner descriptor.
+ * @returns {string} noun used in the error message.
+ */
+function targetNoun(descriptor) {
+  const mode = descriptor?.selection?.mode
+  if (mode === 'files') return 'file pattern'
+  if (mode === 'nodeids') return 'test id'
+  return 'package pattern'
+}
+
+/**
+ * Validate the selection entries against the runner's own rule.
+ *
+ * A runner whose `selection.mode` is `none` takes no selection at all, and a
+ * descriptor without a `validate` hook (a stubbed or older core) leaves the
+ * check to the runner itself when the process is spawned — the routes never
+ * invent a stricter rule than the runner documents, because that would refuse
+ * targets the runner accepts (`calc add` for `pytest -k`).
+ * @param descriptor - runner descriptor.
+ * @param targets - selection entries from the request.
+ * @returns nothing; throws with a readable message on the first refusal.
+ */
+function checkTargets(descriptor, targets) {
+  if (targets.length === 0) return
+  const selection = descriptor?.selection ?? {}
+  if (selection.mode === 'none' || selection.mode === undefined) return
+  if (typeof selection.validate !== 'function') return
+  for (const target of targets) {
+    if (selection.validate(target)) continue
+    const hint = trimId(selection.placeholder)
+    throw new Error(
+      `${targetNoun(descriptor)} "${target}" is not allowed for runner "${descriptor.id}"` +
+        (hint === null ? '' : `; use relative patterns such as ${hint}`),
+    )
+  }
+}
+
+/**
+ * Validate the test-name filter against the runner's own rule.
+ *
+ * A named runner always carries a `nameFilter` (or `null` when its flag does not
+ * exist); a filter that allows spaces must let `calc add` through, which is the
+ * whole reason the rule lives on the descriptor instead of in one global regex.
+ * @param descriptor - runner descriptor.
+ * @param pattern - trimmed pattern ('' means "no filter").
+ * @returns nothing; throws with a readable message.
+ */
+function checkPattern(descriptor, pattern) {
+  if (pattern === '') return
+  const filter = descriptor?.nameFilter ?? null
+  if (filter === null) return
+  if (typeof filter.validate === 'function') {
+    if (filter.validate(pattern)) return
+  } else if (filter.allowSpaces === true) {
+    return
+  } else if (!/\s/.test(pattern)) {
+    return
+  }
+  const hint = trimId(filter.placeholder)
+  throw new Error(
+    `test name pattern "${pattern}" is not allowed for runner "${descriptor.id}"` +
+      (hint === null ? '' : `; use a pattern such as ${hint}`),
+  )
+}
+
+/**
+ * Validate the flag switches against the runner's descriptor.
+ *
+ * Unknown ids are refused rather than ignored: a caller that asks for `race` on
+ * vitest would otherwise be told "started" while the switch silently did
+ * nothing.
+ * @param descriptor - runner descriptor.
+ * @param flags - {flagId: boolean} from the request.
+ * @returns nothing; throws with a readable message.
+ */
+function checkFlags(descriptor, flags) {
+  if (typeof flags !== 'object' || flags === null || Array.isArray(flags)) {
+    throw new Error('flags must be an object of {flagId: boolean}, e.g. {"verbose": true}')
+  }
+  // 'auto' has no descriptor yet: the runner that ends up running validates it.
+  if (descriptor === null) {
+    for (const [id, value] of Object.entries(flags)) {
+      if (typeof value !== 'boolean') throw new Error(`flag "${id}" must be true or false`)
+    }
+    return
+  }
+  const known = Array.isArray(descriptor.flags) ? descriptor.flags : []
+  for (const [id, value] of Object.entries(flags)) {
+    if (typeof value !== 'boolean') throw new Error(`flag "${id}" must be true or false`)
+    if (!known.some(flag => flag?.id === id)) {
+      const names = known.map(flag => flag?.id).filter(name => typeof name === 'string')
+      throw new Error(
+        `unknown flag "${id}" for runner "${descriptor.id}"; ` +
+          (names.length === 0 ? 'it takes no flags' : `available: ${names.join(', ')}`),
+      )
+    }
+  }
+}
+
+/**
+ * Check a run request before anything is spawned.
+ *
+ * The routes never rewrite the options — the runner's own `normalizeRunOptions`
+ * stays the authority on argv — so this is a pre-flight refusal with a readable
+ * message: an unknown runner, a script runner the host did not enable, a
+ * selection entry or name filter the runner cannot express, or a flag its argv
+ * has no room for. `runner` absent means "the host default", which is the
+ * historical Go behaviour for a client written before runners existed; `auto`
+ * defers the selection checks to the detected runner at spawn time.
+ * @param hub - run registry (read for the host's runner settings).
+ * @param options - raw run options as they will be handed to the runner.
+ * @returns the descriptor that was used, or null for `auto`.
+ */
+export function checkRunRequest(hub, options) {
+  const input = options !== null && typeof options === 'object' ? options : {}
+  const { allowScriptRunners, defaultRunner } = runnerSettings(hub)
+  if (input.runner !== undefined && typeof input.runner !== 'string') {
+    throw new Error('runner must be a string such as "go", "pytest" or "auto"')
+  }
+  const requested = trimId(input.runner) ?? defaultRunner
+  let descriptor = null
+  if (requested !== AUTO_RUNNER) {
+    descriptor = RUNNERS[requested] ?? null
+    if (descriptor === null) {
+      const known = [...Object.keys(RUNNERS), AUTO_RUNNER].join(', ')
+      throw new Error(`unknown runner "${requested}"; use one of ${known}`)
+    }
+    if (descriptor.scriptRunner === true && allowScriptRunners !== true) {
+      throw new Error(
+        `runner "${descriptor.id}" is disabled on this host; set allowScriptRunners: true in the plugin config to enable it`,
+      )
+    }
+  }
+  const targets = Array.isArray(input.targets)
+    ? input.targets.map(String)
+    : Array.isArray(input.packages)
+      ? input.packages.map(String)
+      : []
+  if (descriptor !== null) {
+    checkTargets(descriptor, targets)
+    checkPattern(descriptor, typeof input.pattern === 'string' ? input.pattern.trim() : '')
+  }
+  if (input.flags !== undefined && input.flags !== null) checkFlags(descriptor, input.flags)
+  return descriptor
+}
+
 /** Heartbeat interval: proxies drop an idle SSE connection otherwise. */
 const PING_INTERVAL_MS = 15000
 
@@ -494,6 +699,19 @@ async function handle(req, res, hub, resolver) {
     })
   }
 
+  if (path === `${ROUTE_PREFIX}/runners`) {
+    if (method !== 'GET') return sendJson(res, 405, { error: 'GET required' })
+    // Catalog only: which runners this build understands, which one a request
+    // gets when it names none, and whether the script runner is switched on. The
+    // panel uses it to render the picker and to grey out what cannot run here.
+    const { allowScriptRunners, defaultRunner } = runnerSettings(hub)
+    return sendJson(res, 200, {
+      runners: runnerList(hub, allowScriptRunners),
+      defaultRunner,
+      allowScriptRunners,
+    })
+  }
+
   if (path === `${ROUTE_PREFIX}/status`) {
     if (method !== 'GET') return sendJson(res, 405, { error: 'GET required' })
     const id = url.searchParams.get('id')
@@ -521,6 +739,11 @@ async function handle(req, res, hub, resolver) {
       const context = sessionContext(resolver, body.sessionId, 'panel')
       const options = { ...body }
       delete options.sessionId
+      // Refuse what the runner could never express *before* spawning anything:
+      // the mapping from these options to argv still belongs to the runner, this
+      // is only the pre-flight check (unknown runner, disabled script runner,
+      // selection/pattern/flag the descriptor rejects).
+      checkRunRequest(hub, options)
       const run = hub.start(options, context)
       return sendJson(res, 202, run)
     } catch (error) {

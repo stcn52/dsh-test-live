@@ -1,0 +1,3 @@
+=== RUN   TestPanic
+panic: boom
+FAIL	github.com/x/y	0.5s

@@ -1,0 +1,10 @@
+
+ RUN  v5.0.5 /tmp/lang-fixtures/vitest
+
+ ✓ tests/pass.test.js (2 tests) 3ms
+
+ Test Files  1 passed (1)
+      Tests  2 passed (2)
+   Start at  17:50:53
+   Duration  151ms (transform 51%, import 27%, worker 11%, tests 10%)
+

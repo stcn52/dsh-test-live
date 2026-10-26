@@ -1,0 +1,5 @@
+=== RUN   TestA
+--- PASS: TestA (0.00s)
+PASS
+ok  	github.com/x/y	0.123s
+coverage: 81.2% of statements

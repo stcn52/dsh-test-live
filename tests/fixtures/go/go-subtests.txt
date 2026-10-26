@@ -1,0 +1,4 @@
+=== RUN   TestB
+=== RUN   TestB/sub
+--- FAIL: TestB/sub (0.01s)
+--- FAIL: TestB (0.01s)

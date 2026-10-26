@@ -8,7 +8,8 @@
  * @module dsh-test-live/tools
  */
 
-import { selectFollowRoot } from '../host/routes.js'
+import { detectRunner, RUNNERS } from '../core/runners.js'
+import { AUTO_RUNNER, checkRunRequest, selectFollowRoot } from '../host/routes.js'
 
 /** How many trailing lines a tool output carries by default. */
 const DEFAULT_TAIL = 120
@@ -26,11 +27,102 @@ const MAX_LIST_LIMIT = 100
 const MAX_LIST_TAIL_LINES = 200
 
 /**
+ * How each runner's own documentation spells "run the tests and write the log".
+ *
+ * The follow hint used to be hard-coded to `go test ./...`, which was wrong on
+ * every project that is not a Go module; the id here is the resolved runner, so
+ * the hint matches the grammar the panel will parse the file with.
+ */
+const WRITE_WITH = {
+  go: 'go test ./...',
+  pytest: 'pytest -v',
+  vitest: 'pnpm exec vitest run',
+  jest: 'pnpm exec jest --verbose',
+  nodeTest: 'node --test',
+}
+
+
+/**
  * @param value - any value.
  * @returns the trimmed string, or null when it carries nothing.
  */
 function textOf(value) {
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : null
+}
+
+/**
+ * The `runner:` line of a report.
+ *
+ * A run records the runner that resolved from `auto`, so the model never has to
+ * guess which grammar produced the counters it is reading. A run restored from
+ * history written before runners existed honestly says so instead of pretending
+ * it ran the Go pipeline.
+ * @param meta - run meta.
+ * @returns the report line.
+ */
+function runnerLine(meta) {
+  const id = textOf(meta?.runner)
+  if (id === null) return 'runner: not recorded'
+  const label = textOf(meta.runnerLabel)
+  return label === null || label === id ? `runner: ${id}` : `runner: ${id} (${label})`
+}
+
+/**
+ * The command that writes a log for one runner.
+ *
+ * Runners with a documented invocation get their own spelling; anything else
+ * (a `generic` host with a configured command, a script runner) falls back to
+ * its descriptor's executable and base args, and only when that is absent too to
+ * the historical Go command.
+ * @param runnerId - resolved runner id.
+ * @returns a shell fragment to append `2>&1 | tee <file>` to.
+ */
+function writeWith(runnerId) {
+  const documented = WRITE_WITH[runnerId]
+  if (documented !== undefined) return documented
+  const descriptor = RUNNERS[runnerId]
+  const executable = textOf(descriptor?.executable)
+  if (executable !== null) {
+    const args = Array.isArray(descriptor.baseArgs) ? descriptor.baseArgs.map(String) : []
+    return [executable, ...args].join(' ')
+  }
+  return WRITE_WITH.go
+}
+
+/**
+ * The runner a follow call belongs to.
+ *
+ * An explicit id wins; otherwise the newest run of the same conversation says
+ * which runner this project uses; otherwise the conversation's own directory is
+ * detected once. Detection is a hint, never a reason to refuse a follow, so
+ * every step degrades to the historical Go wording.
+ * @param hub - run registry.
+ * @param context - conversation ownership.
+ * @param requested - `runner` argument of the call, if any.
+ * @returns a runner id.
+ */
+function followRunner(hub, context, requested) {
+  const explicit = textOf(requested)
+  if (explicit !== null && explicit !== AUTO_RUNNER) return explicit
+  const sessionId = context?.sessionId ?? null
+  let latest = null
+  try {
+    latest = (sessionId === null ? hub.latest?.() : hub.latest?.({ sessionId })) ?? null
+  } catch {
+    latest = null
+  }
+  const fromRun = textOf(latest?.runner)
+  if (fromRun !== null) return fromRun
+  const cwd = textOf(context?.cwd)
+  if (cwd !== null) {
+    try {
+      const detected = textOf(detectRunner(cwd)?.id)
+      if (detected !== null) return detected
+    } catch {
+      // A directory the detector cannot read is not a reason to refuse the follow.
+    }
+  }
+  return 'go'
 }
 
 /**
@@ -124,6 +216,7 @@ function report(hub, meta, tail) {
   return [
     `${meta.command} ${meta.args.join(' ')}`,
     `cwd: ${meta.cwd}`,
+    runnerLine(meta),
     who === null ? '' : `session: ${who}`,
     meta.summaryText,
     omitted > 0 ? `(last ${slice.length} of ${lines.length} lines)` : '',
@@ -142,6 +235,7 @@ export function registerTools(ctx, hub, resolver) {
     name: 'test_live_run',
     description: [
       'Start the configured test command and stream its output into the dsh-test-live sidebar panel.',
+      'Pick the runner with runner ("go", "pytest", "vitest", …; "auto" detects it from the project).',
       'Returns immediately: the run is detached from the call and keeps streaming, so a slow or hung test',
       'never holds the host — read progress with test_live_status and stop it with test_live_cancel.',
       'Pass wait=true only when the run is known to be short; such a wait is abandoned as soon as the',
@@ -150,18 +244,36 @@ export function registerTools(ctx, hub, resolver) {
     parameters: {
       type: 'object',
       properties: {
+        runner: {
+          type: 'string',
+          enum: [AUTO_RUNNER, ...Object.keys(RUNNERS)],
+          description:
+            'Runner id ("go", "vitest", "jest", "nodeTest", "pytest", "script", "generic") or "auto" ' +
+            'to detect it from the project (the host default). test_live_status reports which runner a run used.',
+        },
+        targets: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'What to run: package patterns for Go, file patterns for vitest/jest/node --test, ' +
+            'node ids for pytest. Defaults to the runner\'s own default.',
+        },
         packages: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Relative Go package patterns, e.g. ["./..."]. Defaults to ["./..."].',
+          description: 'Legacy alias of targets (Go package patterns), e.g. ["./..."].',
         },
         pattern: {
           type: 'string',
-          description: 'Value for -run (a test-name regex such as "TestApplyMigrations").',
+          description: 'Test-name filter for the runner (Go -run, pytest -k, vitest -t, …).',
         },
-        verbose: { type: 'boolean', description: 'Pass -v so every test name is streamed.' },
-        race: { type: 'boolean', description: 'Pass -race.' },
-        count: { type: 'boolean', description: 'Pass -count=1 (disable the test result cache).' },
+        flags: {
+          type: 'object',
+          description: 'Runner switches by descriptor id, e.g. {"verbose": true, "race": true}.',
+        },
+        verbose: { type: 'boolean', description: 'Legacy alias of flags.verbose: stream every test name.' },
+        race: { type: 'boolean', description: 'Legacy alias of flags.race: pass -race (Go).' },
+        count: { type: 'boolean', description: 'Legacy alias of flags.count: pass -count=1 (Go).' },
         timeoutSec: { type: 'integer', description: 'Per-run wall-clock cap in seconds.' },
         wait: { type: 'boolean', description: 'Wait for the run to finish before returning (default false).' },
         waitSec: {
@@ -178,6 +290,10 @@ export function registerTools(ctx, hub, resolver) {
     },
     async execute(args, exec) {
       const options = args && typeof args === 'object' ? args : {}
+      // Refused before anything is spawned: an unknown runner, a disabled script
+      // runner, a target/pattern/flag the descriptor cannot express. The argv
+      // itself still comes from the runner's own normalization inside the hub.
+      checkRunRequest(hub, options)
       // Ownership comes from the call, never from the arguments: the run belongs
       // to the conversation that asked for it and is spawned in that cwd.
       const meta = hub.start(options, callContext(exec, resolver, 'tool'))
@@ -224,7 +340,7 @@ export function registerTools(ctx, hub, resolver) {
   ctx.tools.register({
     name: 'test_live_status',
     description: [
-      'Read one dsh-test-live run: status, per-package counters, failures and the tail of the log.',
+      'Read one dsh-test-live run: status, the runner that produced it, per-suite counters, failures and the tail of the log.',
       'Defaults to the newest run of the current conversation; pass sessionId to read another conversation,',
       'or id for one exact run. Use test_live_runs to see what other conversations are running.',
     ].join(' '),
@@ -272,6 +388,13 @@ export function registerTools(ctx, hub, resolver) {
           type: 'string',
           description: 'Log file to follow, absolute or relative to the follow root (e.g. "fulltest.log").',
         },
+        runner: {
+          type: 'string',
+          enum: [AUTO_RUNNER, ...Object.keys(RUNNERS)],
+          description:
+            'Runner whose grammar parses the file. Defaults to the newest run of this conversation, ' +
+            'else what the conversation directory detects.',
+        },
       },
       required: ['path'],
       additionalProperties: false,
@@ -282,17 +405,30 @@ export function registerTools(ctx, hub, resolver) {
     },
     execute(args, exec) {
       const options = args && typeof args === 'object' ? args : {}
+      // A named runner is checked like a run would be, so a typo fails here with
+      // a readable message instead of producing a hint for a runner that does not
+      // exist.
+      if (options.runner !== undefined && options.runner !== null) checkRunRequest(hub, { runner: options.runner })
       // The conversation's cwd joins the allowed roots for this follow, so a log
       // inside the conversation's directory is reachable; anything outside every
       // root still throws and surfaces as a tool error.
       const context = callContext(exec, resolver, 'tool')
       const root = selectFollowRoot(hub, context, options.path, undefined)
+      // Read the hint *before* the follow registers its own (runner-less) file
+      // run, or the newest run of the conversation would be the very run this
+      // call is creating.
+      const hinted = followRunner(hub, context, options.runner)
       const meta = hub.follow(options.path, root, context)
+      // The hub's own record wins (it may have detected the runner itself); the
+      // written hint then matches the grammar the panel parses the file with.
+      const runnerId = textOf(meta.runner) ?? hinted
       return {
         id: meta.id,
         status: meta.status,
+        runner: runnerId,
         text: `following ${meta.file} as ${meta.id}\n` +
-          'write with: go test ./... 2>&1 | tee ' + meta.file,
+          `runner: ${runnerId}\n` +
+          `write with: ${writeWith(runnerId)} 2>&1 | tee ${meta.file}`,
       }
     },
   })

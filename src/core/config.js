@@ -10,6 +10,7 @@
 
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { RUNNERS, RUNNER_IDS, buildRunArgv, validatePattern, validateTarget } from './runners.js'
 
 /**
  * Where finished runs are kept when the deployment does not name a file.
@@ -28,6 +29,16 @@ export const DEFAULTS = {
   // 'go-test' derives -v/-race/-run/-timeout and package patterns; 'command'
   // runs exactly `command + baseArgs` and ignores those options.
   kind: 'go-test',
+  // Which runner descriptor executes a run: a concrete id (go, vitest, jest,
+  // nodeTest, pytest, script, generic) or 'auto' to detect it from the project
+  // directory. The default is 'go' and not 'auto' on purpose: a deployment that
+  // configured nothing must keep the exact argv it ran before descriptors
+  // existed (`kind` already defaults to 'go-test'), while a profile that wants
+  // detection opts in with `runner: 'auto'`.
+  runner: 'go',
+  // Off by default: the script runner delegates to the project's own `test`
+  // script — code this plugin does not control — so a deployment has to say so.
+  allowScriptRunners: false,
   // The run directory is only a *fallback*: a run belongs to the conversation
   // that started it, and the session's own cwd wins whenever there is one.
   cwd: null,
@@ -68,10 +79,13 @@ export const DEFAULTS = {
 export function resolveConfig(raw) {
   const config = raw ?? {}
   const kind = config.kind === 'command' ? 'command' : 'go-test'
+  const runner = resolveRunner(config, kind)
   const followRoot =
     typeof config.followRoot === 'string' && config.followRoot.trim() !== '' ? config.followRoot.trim() : null
   const settings = {
     kind,
+    runner,
+    allowScriptRunners: config.allowScriptRunners === true,
     cwd: typeof config.cwd === 'string' && config.cwd.trim() !== '' ? config.cwd.trim() : null,
     command: typeof config.command === 'string' && config.command.trim() !== '' ? config.command.trim() : DEFAULTS.command,
     baseArgs: Array.isArray(config.baseArgs) ? config.baseArgs.map(String) : DEFAULTS.baseArgs.slice(),
@@ -198,11 +212,131 @@ export function isPlainObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-/** Package patterns accepted from the panel: relative Go patterns only. */
-const PACKAGE_PATTERN = /^\.{0,2}\/?[A-Za-z0-9_.\-/]*$/
+/**
+ * Normalize the `runner` value of a config row or a run request.
+ * @param value - candidate: `'auto'`, a runner id, or empty.
+ * @param origin - where the value came from, for the error message.
+ * @returns null (absent), `'auto'`, or a known runner id.
+ */
+function normalizeRunnerChoice(value, origin) {
+  if (value === undefined || value === null || value === '') return null
+  if (typeof value !== 'string') {
+    throw new Error(`dsh-test-live: ${origin}.runner must be a string`)
+  }
+  const wanted = value.trim().toLowerCase()
+  if (wanted === 'auto') return 'auto'
+  const known = RUNNER_IDS.find(id => id.toLowerCase() === wanted)
+  if (known === undefined) {
+    throw new Error(
+      `dsh-test-live: ${origin}.runner "${value}" is not a known runner (${RUNNER_IDS.join(', ')}, auto)`,
+    )
+  }
+  return known
+}
 
-/** Test-name regexes accepted from the panel (`-run`). */
-const TEST_PATTERN = /^[A-Za-z0-9_./|()[\]*+?^$-]+$/
+/**
+ * Resolve the config row's runner, keeping the historical `kind` mapping.
+ *
+ * `kind: 'command'` *is* the generic runner, so pairing it with another runner
+ * is a contradiction the deployment should hear about at load time rather than
+ * on its first run.
+ * @param config - the plugin row config.
+ * @param kind - normalized kind.
+ * @returns a runner id or `'auto'`.
+ */
+function resolveRunner(config, kind) {
+  const choice = normalizeRunnerChoice(config.runner, 'config')
+  if (kind === 'command') {
+    if (choice !== null && choice !== 'generic') {
+      throw new Error(
+        `dsh-test-live: config.kind "command" conflicts with config.runner "${config.runner}" (command is the generic runner)`,
+      )
+    }
+    return 'generic'
+  }
+  return choice ?? RUNNERS.go.id
+}
+
+/**
+ * The runner id that validated requests before descriptors existed: the legacy
+ * `kind` mapping. It is the fallback rule for `runner: 'auto'`, whose real
+ * descriptor is only known once the run's directory is resolved.
+ * @param settings - resolved plugin config.
+ * @returns 'go' or 'generic'.
+ */
+function legacyRunnerId(settings) {
+  return settings?.kind === 'command' ? 'generic' : 'go'
+}
+
+/**
+ * Which descriptor validates a request that has not resolved its runner yet.
+ *
+ * `runner: 'auto'` is resolved by detection inside the hub, so at request time
+ * only the shape can be checked: the union of the target rules accepts a Go
+ * package pattern, a relative file path and a pytest node id while still
+ * refusing an absolute path. The hub re-validates against the detected
+ * descriptor before spawning anything.
+ * @param requested - the request's runner choice (null, `'auto'`, or an id).
+ * @param settings - resolved plugin config.
+ * @returns `{ descriptor, permissive }`.
+ */
+function validationRule(requested, settings) {
+  if (requested !== null && requested !== 'auto') return { descriptor: RUNNERS[requested], permissive: false }
+  if (requested === null) {
+    const configured = typeof settings?.runner === 'string' ? settings.runner : 'go'
+    if (configured !== 'auto') return { descriptor: RUNNERS[configured] ?? RUNNERS.go, permissive: false }
+  }
+  return { descriptor: RUNNERS[legacyRunnerId(settings)], permissive: true }
+}
+
+/**
+ * @param rule - validation rule.
+ * @param target - the refused target.
+ * @returns a readable error, worded for the runner that refused it.
+ */
+function targetError(rule, target) {
+  if (rule.descriptor.id === 'go') {
+    return new Error(
+      `package pattern "${target}" is not allowed; use relative patterns such as ./... or ./database/kdb`,
+    )
+  }
+  return new Error(`target "${target}" is not allowed for runner "${rule.descriptor.id}"; ${rule.descriptor.selection.hint}`)
+}
+
+/**
+ * @param rule - validation rule.
+ * @param pattern - the refused test-name pattern.
+ * @returns a readable error, worded for the runner that refused it.
+ */
+function patternError(rule, pattern) {
+  if (rule.descriptor.id === 'go') {
+    return new Error(`test pattern "${pattern}" contains unsupported characters`)
+  }
+  return new Error(`test pattern "${pattern}" is not allowed for runner "${rule.descriptor.id}"`)
+}
+
+/**
+ * Refuse any target the runner would not accept. Shared with the hub, which
+ * re-checks after `auto` detection resolved a concrete descriptor.
+ * @param descriptor - runner descriptor.
+ * @param targets - targets about to become argv elements.
+ */
+export function assertTargets(descriptor, targets) {
+  const rule = { descriptor, permissive: false }
+  for (const target of targets) {
+    if (!validateTarget(descriptor, target)) throw targetError(rule, target)
+  }
+}
+
+/**
+ * Refuse a test-name pattern the runner would not accept.
+ * @param descriptor - runner descriptor.
+ * @param pattern - the pattern (empty means "no filter" and is always fine).
+ */
+export function assertPattern(descriptor, pattern) {
+  if (typeof pattern !== 'string' || pattern === '') return
+  if (!validatePattern(descriptor, pattern)) throw patternError({ descriptor, permissive: false }, pattern)
+}
 
 /**
  * Validate the optional run options coming from HTTP or a tool call.
@@ -212,43 +346,81 @@ const TEST_PATTERN = /^[A-Za-z0-9_./|()[\]*+?^$-]+$/
  */
 export function normalizeRunOptions(options, settings) {
   const input = isPlainObject(options) ? options : {}
-  const packages = Array.isArray(input.packages) ? input.packages.map(String) : []
-  for (const pattern of packages) {
-    if (!PACKAGE_PATTERN.test(pattern) || pattern.startsWith('/')) {
-      throw new Error(`package pattern "${pattern}" is not allowed; use relative patterns such as ./... or ./database/kdb`)
+  const requested = normalizeRunnerChoice(input.runner, 'run option')
+  const rule = validationRule(requested, settings)
+  const explicit = []
+  const listed = Array.isArray(input.targets) ? input.targets : Array.isArray(input.packages) ? input.packages : []
+  for (const candidate of listed) explicit.push(String(candidate))
+  if (rule.permissive) {
+    // `auto` has no descriptor yet: accept the union of the runner shapes.
+    for (const target of explicit) {
+      const accepted =
+        validateTarget(RUNNERS.go, target) ||
+        validateTarget(RUNNERS.vitest, target) ||
+        validateTarget(RUNNERS.pytest, target)
+      if (!accepted) throw targetError(rule, target)
     }
+  } else {
+    assertTargets(rule.descriptor, explicit)
   }
   let pattern = ''
   if (typeof input.pattern === 'string') pattern = input.pattern.trim()
-  if (pattern !== '' && !TEST_PATTERN.test(pattern)) {
-    throw new Error(`test pattern "${pattern}" contains unsupported characters`)
+  if (pattern !== '') {
+    if (rule.permissive) {
+      if (!validatePattern(RUNNERS.go, pattern) && !validatePattern(RUNNERS.vitest, pattern)) {
+        throw patternError(rule, pattern)
+      }
+    } else {
+      assertPattern(rule.descriptor, pattern)
+    }
   }
   const timeoutSec = positiveInt(input.timeoutSec, settings.defaultTimeoutSec, 1, 24 * 3600)
+  // Flag ids are the descriptor's; `verbose`/`race`/`count` remain the legacy
+  // spelling of the same three switches (`-v`, `-race`, `-count=1`).
+  const flags = {}
+  if (isPlainObject(input.flags)) {
+    for (const [id, value] of Object.entries(input.flags)) flags[id] = value === true
+  }
+  for (const id of ['verbose', 'race', 'count']) {
+    if (typeof input[id] === 'boolean') flags[id] = input[id]
+  }
+  const targets = explicit.length > 0 ? explicit : rule.descriptor.selection.default.slice()
   return {
     // An empty list means "the whole module", the same default the panel shows.
-    packages: packages.length > 0 ? packages : settings.kind === 'go-test' ? ['./...'] : [],
+    targets,
+    // Transitional alias: the name this field had before multiple runners.
+    packages: targets.slice(),
+    targetsExplicit: explicit.length > 0,
+    // null = follow the configured runner; 'auto' = detect it in the hub.
+    runner: requested,
     pattern,
-    verbose: input.verbose === true,
-    race: input.race === true,
-    count: input.count === true,
+    flags,
     timeoutSec,
   }
 }
 
 /**
- * Build the argv (without the executable) for one run.
- * @param options - normalized run options.
+ * Build the argv (without the executable) of one Go run.
+ *
+ * Kept as the compatibility entry point for callers that predate descriptors;
+ * it delegates to the `go` descriptor, which is where the flag order
+ * (-v -race -count=1 -run=X -timeout=Ns <packages>) now lives.
+ * @param options - normalized run options (old or new shape).
  * @param kind - 'go-test' or 'command'.
  * @returns argument list.
  */
 export function buildArgs(options, kind = DEFAULTS.kind) {
   if (kind === 'command') return []
-  const args = []
-  if (options.verbose) args.push('-v')
-  if (options.race) args.push('-race')
-  if (options.count) args.push('-count=1')
-  if (options.pattern !== '') args.push(`-run=${options.pattern}`)
-  args.push(`-timeout=${options.timeoutSec}s`)
-  for (const pattern of options.packages) args.push(pattern)
-  return args
+  const flags = isPlainObject(options?.flags) ? options.flags : {}
+  return buildRunArgv(RUNNERS.go, {
+    targets: options?.targets ?? options?.packages ?? [],
+    pattern: options?.pattern,
+    flags: {
+      verbose: flags.verbose === true || options?.verbose === true,
+      race: flags.race === true || options?.race === true,
+      count: flags.count === true || options?.count === true,
+    },
+    timeoutSec: options?.timeoutSec,
+  })
 }
+

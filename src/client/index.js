@@ -13,6 +13,25 @@ window.__ModuleLoader__.load({
     var ROUTE = '/test-live'
     var MAX_RENDERED = 2500
 
+    // localStorage keys. The target text used to be "packages"; the old key is
+    // still read so an upgrading install keeps its patterns.
+    var PREF_RUNNER = 'dsh-test-live:runner'
+    var PREF_TARGETS = 'dsh-test-live:targets'
+    var PREF_PACKAGES = 'dsh-test-live:packages'
+    var PREF_VERBOSE = 'dsh-test-live:verbose'
+
+    // Command prefixes for the empty-state example. GET /test-live/runners does
+    // not project executable/baseArgs, so the client mirrors them here; an id it
+    // does not know falls back to the pre-runner Go wording.
+    var RUNNER_PREFIX = {
+      go: 'go test',
+      vitest: 'pnpm exec vitest run',
+      jest: 'pnpm exec jest',
+      nodeTest: 'node --test',
+      pytest: 'pytest',
+      script: 'pnpm test',
+    }
+
     var CSS = [
       '.dtl-root { display: flex; flex-direction: column; height: 100%; min-height: 0; color: var(--fg, #e6e9ef); font-size: 13px; }',
       '.dtl-bar { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border, #2a2f3a); flex-wrap: wrap; flex: 0 0 auto; }',
@@ -66,6 +85,8 @@ window.__ModuleLoader__.load({
       '.dtl-bar button.dtl-seg { padding: 2px 9px; font-size: 11.5px; border-radius: 999px; opacity: 0.72; }',
       '.dtl-bar button.dtl-seg.is-active { opacity: 1; color: var(--fg, #e6e9ef); background: var(--accent-soft, rgba(110,168,254,0.22)); border-color: var(--accent, #6ea8fe); }',
       '.dtl-select { font: inherit; font-size: 11.5px; color: inherit; background: var(--surface-2, #1b202a); border: 1px solid var(--border, #2a2f3a); border-radius: 7px; padding: 3px 6px; max-width: 220px; }',
+      '.dtl-runner { max-width: 190px; }',
+      '.dtl-note { font-size: 11px; color: var(--fg-muted, #98a2b3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 240px; }',
       '.dtl-run-session { white-space: nowrap; font-size: 10.5px; color: var(--fg-muted, #98a2b3); opacity: 0.85; }',
       '.dtl-run-hist { color: #c3a6ff; }',
     ].join('\n')
@@ -130,8 +151,11 @@ window.__ModuleLoader__.load({
 
     /** Keep only lines the "failures only" filter should show. */
     function isFailureLine(line) {
-      if (line.kind === 'fail' || line.kind === 'package-fail' || line.kind === 'build' || line.kind === 'panic') return true
-      return false
+      var kind = String(line.kind || '')
+      // The grammars keep the old kinds (package-fail, build) and add their own
+      // suite-level ones, so match the shape instead of a fixed list.
+      if (kind === 'fail' || kind === 'error' || kind === 'build' || kind === 'panic') return true
+      return /-fail$/.test(kind)
     }
 
     /** Last path segment, for the file-follow chips. */
@@ -195,6 +219,276 @@ window.__ModuleLoader__.load({
       var url = ROUTE + '/runs?scope=' + (bySession ? 'session' : 'all')
       if (bySession) url += '&sessionId=' + encodeURIComponent(sessionId)
       return url
+    }
+
+    // -------------------------------------------------------------------------
+    // Runner descriptors (GET /test-live/runners).
+    //
+    // The host's projection is deliberately small — id, label, language,
+    // selectionPlaceholder, flags, labels, available, reason — so every reader
+    // below is tolerant about the exact shape. An older host serves 404 and the
+    // panel then behaves exactly like the pre-runner version.
+    // -------------------------------------------------------------------------
+
+    /** Shorthand for Object.prototype.hasOwnProperty. */
+    function hasOwn(object, key) {
+      return Object.prototype.hasOwnProperty.call(object, key)
+    }
+
+    /**
+     * The runner the user picked, or null. The value is JSON-encoded like the
+     * other preferences, but a bare string is accepted too.
+     */
+    function readRunnerPref() {
+      try {
+        var raw = window.localStorage.getItem(PREF_RUNNER)
+        if (raw === null) return null
+        if (raw.charAt(0) === '"') {
+          var parsed = JSON.parse(raw)
+          return typeof parsed === 'string' && parsed !== '' ? parsed : null
+        }
+        return raw === '' ? null : raw
+      } catch (error) {
+        return null
+      }
+    }
+
+    /** A descriptor field that may sit on the entry or on its `selection` block. */
+    function runnerField(entry, key, fallback) {
+      if (entry) {
+        if (entry[key] !== undefined && entry[key] !== null) return entry[key]
+        var selection = entry.selection
+        if (selection && typeof selection === 'object' && selection[key] !== undefined && selection[key] !== null) {
+          return selection[key]
+        }
+      }
+      return fallback
+    }
+
+    /** Well-formed flag rows of one descriptor, in descriptor order. */
+    function runnerFlagList(entry) {
+      if (!entry || !Array.isArray(entry.flags)) return []
+      var list = []
+      for (var i = 0; i < entry.flags.length; i++) {
+        var flag = entry.flags[i]
+        if (flag && typeof flag.id === 'string' && flag.id !== '') list.push(flag)
+      }
+      return list
+    }
+
+    /** Placeholder of the target input; an empty string means "no target row". */
+    function runnerPlaceholder(entry) {
+      if (!entry) return ''
+      var value = entry.selectionPlaceholder
+      if (value === undefined || value === null) value = runnerField(entry, 'placeholder', '')
+      return value === undefined || value === null ? '' : String(value)
+    }
+
+    /** 'packages'|'files'|'nodeids'|'none'; a missing mode is inferred. */
+    function runnerSelectionMode(entry) {
+      var explicit = runnerField(entry, 'mode', null)
+      if (explicit === null) explicit = runnerField(entry, 'selectionMode', null)
+      if (explicit !== null && explicit !== '') return String(explicit)
+      return runnerPlaceholder(entry) === '' ? 'none' : 'targets'
+    }
+
+    /**
+     * Hint shown next to the target input. The projection carries two of them:
+     * `selectionHint` is about targets ("相对文件路径…"), `hint` is about the
+     * command ("pnpm exec vitest run，-timeout 不进 argv"). The target row wants
+     * the first one; falling back to the second (or to the descriptor's own
+     * `selection.hint`) keeps a narrower host working.
+     */
+    function runnerHint(entry) {
+      if (!entry) return ''
+      var text = runnerField(entry, 'selectionHint', null)
+      if (text === null) text = runnerField(entry, 'hint', '')
+      return text === undefined || text === null ? '' : String(text)
+    }
+
+    /** Target separator of one descriptor; the default is a comma. */
+    function runnerSeparator(entry) {
+      var separator = runnerField(entry, 'separator', ',')
+      return typeof separator === 'string' && separator !== '' ? separator : ','
+    }
+
+    /** Noun the suite counts are labelled with: 包 / 文件 / 用例. */
+    function suiteWord(entry, fallback) {
+      var labels = entry && entry.labels
+      if (labels && typeof labels.suite === 'string' && labels.suite !== '') return labels.suite
+      return fallback || '包'
+    }
+
+    /** Command prefix of the empty-state example, '' when unknown. */
+    function runnerPrefix(entry) {
+      if (!entry) return ''
+      if (typeof entry.command === 'string' && entry.command !== '') return entry.command
+      var known = RUNNER_PREFIX[entry.id]
+      return typeof known === 'string' ? known : ''
+    }
+
+    /** `go test ./...`-style example for the empty state; '' when unknown. */
+    function runnerExample(entry) {
+      var prefix = runnerPrefix(entry)
+      if (prefix === '') return ''
+      var placeholder = runnerPlaceholder(entry)
+      if (placeholder === '' || runnerSelectionMode(entry) === 'none') return prefix
+      return prefix + ' ' + placeholder
+    }
+
+    /** Split the target text on the descriptor's separator. */
+    function splitTargets(text, separator) {
+      var raw = text === null || text === undefined ? '' : String(text)
+      var sep = typeof separator === 'string' && separator !== '' ? separator : ','
+      // A pasted column of targets is common, so a comma list splits on newlines too.
+      var parts = sep === ',' && raw.indexOf('\n') >= 0 ? raw.split(/[\r\n,]+/) : raw.split(sep)
+      var list = []
+      for (var i = 0; i < parts.length; i++) {
+        var item = parts[i].trim()
+        if (item !== '') list.push(item)
+      }
+      return list
+    }
+
+    /** The catalogue entry of one runner id, or null. */
+    function findRunner(entries, id) {
+      if (!entries || !id) return null
+      for (var i = 0; i < entries.length; i++) {
+        if (entries[i] && entries[i].id === id) return entries[i]
+      }
+      return null
+    }
+
+    /** First runner the host did not mark unavailable, else null. */
+    function firstAvailableRunner(entries) {
+      for (var i = 0; i < entries.length; i++) {
+        var entry = entries[i]
+        if (entry && entry.id && entry.available !== false) return entry.id
+      }
+      return null
+    }
+
+    /**
+     * Which runner the panel starts on: the stored choice, then the host's
+     * defaultRunner, then the first usable runner, then "auto".
+     */
+    function resolveRunner(entries, defaultRunner, stored) {
+      var list = entries || []
+      if (stored === 'auto') return 'auto'
+      var storedEntry = findRunner(list, stored)
+      if (storedEntry && storedEntry.available !== false) return stored
+      if (defaultRunner === undefined || defaultRunner === null || defaultRunner === '' || defaultRunner === 'auto') {
+        return 'auto'
+      }
+      var defaultEntry = findRunner(list, defaultRunner)
+      if (defaultEntry && defaultEntry.available !== false) return defaultRunner
+      return firstAvailableRunner(list) || 'auto'
+    }
+
+    /** Checked-set a descriptor starts with: `flag.default` for each flag. */
+    function defaultFlags(entry, verbosePreference) {
+      var list = runnerFlagList(entry)
+      var set = {}
+      for (var i = 0; i < list.length; i++) {
+        set[list[i].id] = list[i].default === true
+      }
+      // The panel has always remembered the -v choice under its own key.
+      if (hasOwn(set, 'verbose') && typeof verbosePreference === 'boolean') {
+        set.verbose = verbosePreference
+      }
+      return set
+    }
+
+    /** Shallow equality of two checked-sets, so an effect does not thrash state. */
+    function sameFlags(left, right) {
+      var key
+      var mine = 0
+      for (key in left) if (hasOwn(left, key)) mine++
+      var theirs = 0
+      for (key in right) if (hasOwn(right, key)) theirs++
+      if (mine !== theirs) return false
+      for (key in left) {
+        if (!hasOwn(left, key)) continue
+        if (!hasOwn(right, key) || left[key] !== right[key]) return false
+      }
+      return true
+    }
+
+    /**
+     * The `flags` field of a run request: `{flagId: boolean}` over every flag of
+     * the descriptor, checked or not.
+     *
+     * The wire shape is an object, not a list of ids: `buildRunArgv` reads
+     * `flags[id] === true` and the route refuses an array outright, so explicit
+     * booleans are the only encoding that also expresses "a default-on flag the
+     * user switched off". An empty object is sent for `auto`, where the panel has
+     * no descriptor to speak for — the host then applies the detected runner's
+     * own defaults.
+     */
+    function flagMap(entry, set) {
+      var list = runnerFlagList(entry)
+      var map = {}
+      for (var i = 0; i < list.length; i++) {
+        map[list[i].id] = Boolean(set && set[list[i].id] === true)
+      }
+      return map
+    }
+
+    /** The legacy `verbose` boolean, taken from the descriptor when it has one. */
+    function verboseFlag(set, fallback) {
+      if (set && hasOwn(set, 'verbose')) return set.verbose === true
+      return fallback === true
+    }
+
+    /** Stored target text of one runner; the pre-runner key seeds the Go runner. */
+    function readTargetsPref(runnerId) {
+      var own = readPref(PREF_TARGETS + ':' + runnerId, null)
+      if (typeof own === 'string') return own
+      if (runnerId === 'go') {
+        var legacy = readPref(PREF_PACKAGES, null)
+        if (typeof legacy === 'string') return legacy
+      }
+      return ''
+    }
+
+    /**
+     * Summary buckets under the new `suites` name, with the pre-rename
+     * `packages` field accepted for runs restored from an old history file.
+     */
+    function suiteBuckets(summary) {
+      if (!summary || typeof summary !== 'object') return null
+      var raw = summary.suites || summary.packages || null
+      if (!raw || typeof raw !== 'object') return null
+      return {
+        ok: Array.isArray(raw.ok) ? raw.ok : [],
+        fail: Array.isArray(raw.fail) ? raw.fail : [],
+        noTest: Array.isArray(raw.noTest) ? raw.noTest : [],
+      }
+    }
+
+    /** Test counters, defaulting every missing number to zero. */
+    function testCounts(summary) {
+      var raw = summary && summary.tests && typeof summary.tests === 'object' ? summary.tests : {}
+      return {
+        pass: typeof raw.pass === 'number' ? raw.pass : 0,
+        fail: typeof raw.fail === 'number' ? raw.fail : 0,
+        skip: typeof raw.skip === 'number' ? raw.skip : 0,
+      }
+    }
+
+    /**
+     * "Which runner actually ran" for the meta line. `detectReason` is only
+     * written when a run resolved `auto`, so it is the honest signal that the
+     * user did not pick this runner by hand.
+     */
+    function runnerLine(meta, entries) {
+      if (!meta || !meta.runner) return ''
+      var id = String(meta.runner)
+      if (id === 'auto') return 'runner：自动识别'
+      var entry = findRunner(entries, id)
+      var label = meta.runnerLabel || (entry && entry.label) || id
+      if (meta.detectReason) return 'runner：自动识别 → ' + label
+      return 'runner：' + label
     }
 
     /** One rendered log line. */
@@ -270,15 +564,31 @@ window.__ModuleLoader__.load({
       var onlyFailState = React.useState(readPref('dsh-test-live:onlyFailures', false))
       var onlyFail = onlyFailState[0]
       var setOnlyFail = onlyFailState[1]
-      var packagesState = React.useState(readPref('dsh-test-live:packages', './...'))
-      var packages = packagesState[0]
-      var setPackages = packagesState[1]
+      // The target text: package patterns, file paths or node ids, per runner.
+      // Pre-runner installs stored it under the "packages" key, which still seeds
+      // the default so an upgrade keeps the patterns the user typed.
+      var targetsState = React.useState(readPref(PREF_PACKAGES, './...'))
+      var targets = targetsState[0]
+      var setTargets = targetsState[1]
       var followState = React.useState(readPref('dsh-test-live:followPath', ''))
       var followPath = followState[0]
       var setFollowPath = followState[1]
       var verboseState = React.useState(readPref('dsh-test-live:verbose', true))
       var verbose = verboseState[0]
       var setVerbose = verboseState[1]
+      // --- runner descriptors (null until /runners answers; null = old host) --
+      var catalogState = React.useState(null)
+      var catalog = catalogState[0]
+      var setCatalog = catalogState[1]
+      var runnerState = React.useState(null)
+      var runnerId = runnerState[0]
+      var setRunnerId = runnerState[1]
+      var flagsState = React.useState({})
+      var flags = flagsState[0]
+      var setFlags = flagsState[1]
+      // Which runner the target text currently belongs to, so switching runners
+      // swaps in that runner's stored targets exactly once.
+      var targetsOwnerRef = React.useRef(null)
 
       var indexRef = React.useRef({})       // seq -> index into lines
       var logRef = React.useRef(null)
@@ -410,6 +720,56 @@ window.__ModuleLoader__.load({
         }
       }, [scope, activeSessionId])
 
+      /**
+       * Ask the host for its runner catalogue. An older host answers 404 (or an
+       * empty list) and the panel simply stays on the pre-runner layout: no
+       * dropdown, no descriptor flags, `packages` on POST. The probe is silent
+       * on purpose — a missing endpoint is not an error the user must see.
+       *
+       * Registered after the run-list effect on purpose: the list is the panel's
+       * primary fetch and must stay first.
+       */
+      React.useEffect(function () {
+        var alive = true
+        requestJson(ROUTE + '/runners').then(function (body) {
+          if (!alive) return
+          var raw = body && Array.isArray(body.runners) ? body.runners : (Array.isArray(body) ? body : null)
+          if (!raw) return
+          var list = []
+          for (var i = 0; i < raw.length; i++) {
+            var entry = raw[i]
+            if (entry && typeof entry.id === 'string' && entry.id !== '') list.push(entry)
+          }
+          // An empty catalogue is the same non-event as a 404.
+          if (list.length === 0) return
+          // The host is the only authority on availability: `allowScriptRunners`
+          // is already folded into each entry's `available`/`reason`, and the
+          // projection has no scriptRunner field to second-guess it with.
+          var hostDefault = body && typeof body.defaultRunner === 'string' ? body.defaultRunner : 'auto'
+          setCatalog({ runners: list })
+          setRunnerId(resolveRunner(list, hostDefault, readRunnerPref()))
+        }).catch(function () {
+          // No catalogue: the legacy layout still works, so nothing to report.
+        })
+        return function () { alive = false }
+      }, [])
+
+      // Checkbox state follows the chosen descriptor: `flag.default` per flag.
+      React.useEffect(function () {
+        if (!catalog || !runnerId) return
+        var entry = findRunner(catalog.runners, runnerId)
+        var next = defaultFlags(entry, readPref(PREF_VERBOSE, true))
+        setFlags(function (previous) { return sameFlags(previous, next) ? previous : next })
+      }, [catalog, runnerId])
+
+      // Each runner remembers its own target text; switching swaps it in once.
+      React.useEffect(function () {
+        if (!catalog || !runnerId) return
+        if (targetsOwnerRef.current === runnerId) return
+        targetsOwnerRef.current = runnerId
+        setTargets(readTargetsPref(runnerId))
+      }, [catalog, runnerId])
+
       // Close the stream when the whole panel goes away.
       React.useEffect(function () {
         return function () {
@@ -492,18 +852,59 @@ window.__ModuleLoader__.load({
         chooseScope('session', injectedSessionId)
       }
 
-      /** Start a run with the current options. */
+      /** Pick a runner from the dropdown; the choice survives a reload. */
+      function chooseRunner(event) {
+        var value = event && event.target ? String(event.target.value === undefined ? '' : event.target.value) : ''
+        if (value === '') return
+        setRunnerId(value)
+        writePref(PREF_RUNNER, value)
+      }
+
+      /** Flip one descriptor flag; the -v choice also keeps its old key. */
+      function toggleFlag(id, checked) {
+        setFlags(function (previous) {
+          var next = {}
+          for (var key in previous) if (hasOwn(previous, key)) next[key] = previous[key]
+          next[id] = checked
+          return next
+        })
+        if (id === 'verbose') writePref(PREF_VERBOSE, checked)
+      }
+
+      /**
+       * Start a run with the current options.
+       *
+       * With a catalogue the body is the descriptor shape (runner / targets /
+       * flags) and keeps `verbose` so an old route still understands it; without
+       * one it is byte-for-byte the pre-runner body.
+       */
       function startRun() {
-        var patterns = packages.split(',').map(function (item) { return item.trim() }).filter(Boolean)
+        var entry = catalog ? findRunner(catalog.runners, runnerId || 'auto') : null
+        var targetsList = splitTargets(targets, catalog ? runnerSeparator(entry) : ',')
+        var body
+        if (catalog) {
+          body = {
+            runner: runnerId || 'auto',
+            flags: flagMap(entry, flags),
+            verbose: verboseFlag(flags, verbose),
+            sessionId: injectedSessionId,
+          }
+          // No targets means "the runner's own default"; the host fills it in, so
+          // the panel never invents a pattern for a runner it does not know yet.
+          if (targetsList.length > 0) body.targets = targetsList
+        } else {
+          body = { packages: targetsList, verbose: verbose, sessionId: injectedSessionId }
+        }
         setBusy(true)
         setError(null)
         requestJson(ROUTE + '/run', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           // The host files this run under the conversation that asked for it.
-          body: JSON.stringify({ packages: patterns, verbose: verbose, sessionId: injectedSessionId }),
+          body: JSON.stringify(body),
         }).then(function (meta) {
-          writePref('dsh-test-live:packages', packages)
+          if (catalog) writePref(PREF_TARGETS + ':' + (runnerId || 'auto'), targets)
+          else writePref(PREF_PACKAGES, targets)
           pinnedRef.current = null
           followIntoView()
           openRun(meta)
@@ -565,13 +966,64 @@ window.__ModuleLoader__.load({
               ? '本对话 '
               : clip(labelForSession(sessions, activeSessionId, null), 12) + ' ') + runs.length + ' 条'
 
+      // --- runner-driven shaping --------------------------------------------
+      // `withRunners` is false for an old host (404), an empty catalogue, or a
+      // fetch that never landed: every branch below then reproduces the layout
+      // and the wording the panel had before runners existed.
+      var entries = catalog && Array.isArray(catalog.runners) ? catalog.runners : null
+      var withRunners = entries !== null
+      var activeId = withRunners ? runnerId || 'auto' : null
+      var activeEntry = withRunners ? findRunner(entries, activeId) : null
+      var activeMode = withRunners ? (activeId === 'auto' ? 'auto' : runnerSelectionMode(activeEntry)) : 'legacy'
+      // "auto" is not a selection mode of its own: the host decides after it looks
+      // at the repository, so the target row stays until then.
+      var showTargetRow = !withRunners || activeMode !== 'none'
+      var targetPlaceholder = withRunners && activeMode !== 'auto' && activeEntry
+        ? runnerPlaceholder(activeEntry) || './...'
+        : './...'
+      var targetHint = withRunners && activeMode !== 'auto' ? runnerHint(activeEntry) : ''
+      var activeFlags = withRunners && activeMode !== 'auto' ? runnerFlagList(activeEntry) : []
+      var activeReason = activeEntry && activeEntry.available === false
+        ? String(activeEntry.reason || '该 runner 不可用')
+        : ''
+      var emptyExample = withRunners && activeMode !== 'auto' ? runnerExample(activeEntry) : 'go test ./...'
+      var runRunnerText = runnerLine(run, entries)
+      // The summary of the open run, read through one tolerant accessor pair.
+      var activeBuckets = run ? suiteBuckets(summary) : null
+      var activeSuiteWord = suiteWord(findRunner(entries, run && run.runner), '包')
+      var activeTests = testCounts(summary)
+
       return h('div', { className: 'dtl-root' },
         h('div', { className: 'dtl-bar' },
+          withRunners
+            ? h('select', {
+              className: 'dtl-select dtl-runner',
+              'data-role': 'runner',
+              value: activeId,
+              title: activeReason || '测试 runner（「自动识别」按仓库内容选择）',
+              onChange: chooseRunner,
+            },
+              h('option', { key: 'auto', value: 'auto' }, '自动识别'),
+              entries.map(function (entry) {
+                var off = entry.available === false
+                return h('option', {
+                  key: entry.id,
+                  value: entry.id,
+                  disabled: off,
+                  title: off
+                    ? String(entry.reason || '不可用')
+                    : String(entry.language || entry.id),
+                }, String(entry.label || entry.id))
+              }),
+            )
+            : null,
           h('button', {
             className: 'dtl-primary',
             disabled: busy || running,
             onClick: startRun,
-            title: '运行测试（go test）',
+            title: '运行测试（' + (withRunners && activeId !== 'auto'
+              ? String((activeEntry && activeEntry.label) || activeId)
+              : withRunners ? '自动识别' : 'go test') + '）',
           }, running ? '运行中…' : '运行'),
           h('button', {
             disabled: busy || !running,
@@ -586,15 +1038,36 @@ window.__ModuleLoader__.load({
             },
             title: '下载完整日志',
           }, '日志'),
-          h('label', { className: 'dtl-check', title: '传给 -v：逐条输出用例名' },
-            h('input', {
-              type: 'checkbox',
-              checked: verbose,
-              onChange: function (event) {
-                setVerbose(event.target.checked)
-                writePref('dsh-test-live:verbose', event.target.checked)
-              },
-            }), '-v'),
+          h('button', { onClick: function () { refreshRuns().catch(function () {}) }, title: '刷新运行列表' }, '刷新'),
+          withRunners
+            ? (activeMode === 'auto'
+              ? h('span', {
+                className: 'dtl-note',
+                title: '自动识别：按仓库里的文件挑 runner，开关取该 runner 的默认值',
+              }, '自动识别')
+              : activeFlags.map(function (flag) {
+                var argv = Array.isArray(flag.argv) ? flag.argv.join(' ') : ''
+                return h('label', {
+                  key: flag.id,
+                  className: 'dtl-check',
+                  title: argv ? '传给测试命令：' + argv : String(flag.label || flag.id),
+                },
+                  h('input', {
+                    type: 'checkbox',
+                    'data-flag': flag.id,
+                    checked: flags[flag.id] === true,
+                    onChange: function (event) { toggleFlag(flag.id, event.target.checked) },
+                  }), String(flag.label || flag.id))
+              }))
+            : h('label', { className: 'dtl-check', title: '传给 -v：逐条输出用例名' },
+              h('input', {
+                type: 'checkbox',
+                checked: verbose,
+                onChange: function (event) {
+                  setVerbose(event.target.checked)
+                  writePref(PREF_VERBOSE, event.target.checked)
+                },
+              }), '-v'),
           h('label', { className: 'dtl-check', title: '新日志到达时自动滚到底部' },
             h('input', {
               type: 'checkbox',
@@ -613,28 +1086,35 @@ window.__ModuleLoader__.load({
                 writePref('dsh-test-live:onlyFailures', event.target.checked)
               },
             }), '只看失败'),
+          activeReason ? h('span', { className: 'dtl-note', title: activeReason }, activeReason) : null,
           run ? h(StatusBadge, { status: run.status }) : null,
           h('span', { className: 'dtl-grow' }),
           connected ? h('span', { className: 'dtl-check' }, '实时') : null,
         ),
-        h('div', { className: 'dtl-bar' },
+        showTargetRow
+          ? h('div', { className: 'dtl-bar', 'data-role': 'targets-row' },
+            h('input', {
+              type: 'text',
+              className: 'dtl-grow',
+              'data-role': 'targets',
+              value: targets,
+              placeholder: targetPlaceholder,
+              spellCheck: false,
+              title: targetHint || ('要运行的' + suiteWord(activeEntry, '包') +
+                '，用「' + runnerSeparator(activeEntry) + '」分隔'),
+              onChange: function (event) { setTargets(event.target.value) },
+              onKeyDown: function (event) {
+                if (event.key === 'Enter' && !busy && !running) startRun()
+              },
+            }),
+            targetHint ? h('span', { className: 'dtl-note', title: targetHint }, targetHint) : null,
+          )
+          : null,
+        h('div', { className: 'dtl-bar', 'data-role': 'follow-row' },
           h('input', {
             type: 'text',
             className: 'dtl-grow',
-            value: packages,
-            placeholder: './...',
-            spellCheck: false,
-            onChange: function (event) { setPackages(event.target.value) },
-            onKeyDown: function (event) {
-              if (event.key === 'Enter' && !busy && !running) startRun()
-            },
-          }),
-          h('button', { onClick: function () { refreshRuns().catch(function () {}) }, title: '刷新运行列表' }, '刷新'),
-        ),
-        h('div', { className: 'dtl-bar' },
-          h('input', {
-            type: 'text',
-            className: 'dtl-grow',
+            'data-role': 'follow',
             value: followPath,
             placeholder: '跟随日志文件（如 fulltest.log）',
             spellCheck: false,
@@ -680,8 +1160,13 @@ window.__ModuleLoader__.load({
         ),
         runs.length > 0
           ? h('div', { className: 'dtl-runs', ref: runsRef }, runs.map(function (item) {
-            var packagesOk = item.summary ? item.summary.packages.ok.length : 0
-            var failed = item.summary && (item.summary.packages.fail.length > 0 || item.summary.tests.fail > 0)
+            var buckets = suiteBuckets(item.summary)
+            var suiteOk = buckets ? buckets.ok.length : 0
+            var failed = buckets
+              ? buckets.fail.length > 0 || testCounts(item.summary).fail > 0
+              : false
+            // Each chip speaks the language of the runner that produced it.
+            var word = suiteWord(findRunner(entries, item.runner), '包')
             var isFile = item.kind === 'file'
             var cwdPart = item.cwd ? clip(baseName(item.cwd), 16) : ''
             return h('button', {
@@ -692,13 +1177,14 @@ window.__ModuleLoader__.load({
               title: labelForSession(sessions, item.sessionId, item.sessionLabel) +
                 ' · ' + (item.cwd || '—') +
                 ' · ' + item.command + ' ' + (item.args || []).join(' ') +
+                (item.runner ? ' · runner ' + item.runner : '') +
                 '  (' + item.id + ')',
               onClick: function () { pickRun(item) },
             },
               h('span', { className: 'dtl-run-id' }, isFile ? '📄 ' + baseName(item.file) : shortId(item.id)),
               h('span', { className: 'dtl-run-sub' },
                 statusLabel(item.status) + ' · ' +
-                (isFile ? item.buffered + ' 行' : packagesOk + ' 包') +
+                (isFile ? item.buffered + ' 行' : suiteOk + ' ' + word) +
                 (failed ? ' · 有失败' : '') +
                 (item.durationMs ? ' · ' + durationText(item) : ''),
                 item.archived ? h('span', { className: 'dtl-run-hist' }, ' · 历史') : null),
@@ -716,6 +1202,8 @@ window.__ModuleLoader__.load({
             ' · ' + (run.cwd || '—') +
             ' · ' + run.id +
             (durationText(run) ? ' · ' + durationText(run) : '')),
+          // What the host actually ran — the only place an "auto" choice is resolved.
+          runRunnerText ? h('div', { className: 'dtl-note' }, runRunnerText) : null,
         ) : null,
         run
           ? h('div', { className: 'dtl-log', ref: logRef }, visible.map(function (line) {
@@ -724,20 +1212,37 @@ window.__ModuleLoader__.load({
           : h('div', { className: 'dtl-empty' },
             h('div', null, scope === 'session' ? '这个对话还没有运行记录。' : '还没有运行记录。'),
             h('div', null, '这里汇总所有对话的测试记录：别的对话里跑完的测试也会出现在这里。'),
-            h('div', null, '点「运行」跑 ', h('code', null, 'go test ./...'), '，或在对话里让我调用 ', h('code', null, 'test_live_run'), '。'),
+            h('div', null, '点「运行」跑 ',
+              // The example follows the selected runner; an unknown one keeps the
+              // pre-runner Go wording. A runner whose argv the client cannot know
+              // (generic: it runs config.command) gets a neutral phrase, not a lie.
+              emptyExample
+                ? h('code', null, emptyExample)
+                : h('span', null, String((activeEntry && (activeEntry.label || activeEntry.id)) || '当前 runner') + ' 的默认命令'),
+              '，或在对话里让我调用 ', h('code', null, 'test_live_run'), '。'),
             h('div', null, '运行中的输出会逐行出现在这里，结束后给出失败汇总。'),
           ),
         run && summary
           ? h('div', { className: 'dtl-foot' },
-            h('span', null, '包：', h('b', null, String(summary.packages.ok.length)), ' 通过',
-              summary.packages.fail.length ? h('span', null, ' · ', h('b', null, String(summary.packages.fail.length)), ' 失败') : null,
-              summary.packages.noTest.length ? h('span', null, ' · ', String(summary.packages.noTest.length), ' 无用例') : null),
-            (summary.tests.pass + summary.tests.fail + summary.tests.skip) > 0
-              ? h('span', null, '用例：', h('b', null, String(summary.tests.pass)), ' 过 · ',
-                h('b', null, String(summary.tests.fail)), ' 败 · ',
-                String(summary.tests.skip), ' 跳过')
+            activeBuckets
+              ? h('span', null,
+                activeSuiteWord + '：',
+                h('b', null, String(activeBuckets.ok.length)), ' 通过',
+                activeBuckets.fail.length
+                  ? h('span', null, ' · ', h('b', null, String(activeBuckets.fail.length)), ' 失败')
+                  : null,
+                activeBuckets.noTest.length
+                  ? h('span', null, ' · ', String(activeBuckets.noTest.length), ' 无用例')
+                  : null)
               : null,
-            summary.buildErrors.length ? h('span', null, '构建错误：', h('b', null, String(summary.buildErrors.length))) : null,
+            (activeTests.pass + activeTests.fail + activeTests.skip) > 0
+              ? h('span', null, '用例：', h('b', null, String(activeTests.pass)), ' 过 · ',
+                h('b', null, String(activeTests.fail)), ' 败 · ',
+                String(activeTests.skip), ' 跳过')
+              : null,
+            summary.buildErrors && summary.buildErrors.length
+              ? h('span', null, '构建错误：', h('b', null, String(summary.buildErrors.length)))
+              : null,
             run.truncated ? h('span', null, '（早期日志已截断）') : null,
             h('span', { style: { marginLeft: 'auto' } }, durationText(run)),
           )

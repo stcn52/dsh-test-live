@@ -85,7 +85,9 @@ test('a passing run streams lines and finishes as passed', async () => {
   assert.equal(finished.status, 'passed')
   assert.deepEqual(seen, ['=== RUN   TestA', '--- PASS: TestA (0.00s)', 'ok  \tpkg/a\t0.1s'])
   assert.equal(finished.summary.tests.pass, 1)
-  assert.deepEqual(finished.summary.packages.ok, ['pkg/a'])
+  // The bucket is `suites` from v2 on; read whichever name this parser has.
+  const buckets = finished.summary.suites ?? finished.summary.packages
+  assert.deepEqual(buckets.ok, ['pkg/a'])
   assert.ok(finished.durationMs >= 0)
 })
 
@@ -448,11 +450,181 @@ test('followRootsFor adds the conversation cwd and follow accepts it', async () 
     assert.equal(meta.sessionId, 'session-a')
     assert.equal(meta.origin, 'tool')
     assert.equal(meta.cwd, dir)
+    // A followed file has no runner: the plugin did not spawn it.
+    assert.equal(meta.runner, null)
     // A root outside the allow-list is still refused.
     assert.throws(() => hub.follow('x.log', '/etc'), /not one of the configured follow roots/)
 
     await until(() => hub.linesSince(meta.id, -1).some(entry => entry.text.includes('pkg/a')))
     hub.cancel(meta.id)
+    hub.dispose()
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// --- runner descriptors in the spawn pipeline -------------------------------
+
+test('a run records its runner, label and argv', () => {
+  const fake = fakeSpawn()
+  const hub = createHub(config({}), { spawn: fake.spawn })
+  const started = hub.start({ packages: ['./...'] })
+  // Unchanged Go argv: the descriptor reproduces the historical flag order.
+  assert.deepEqual(started.args, ['test', '-timeout=900s', './...'])
+  assert.equal(started.runner, 'go')
+  assert.equal(started.runnerLabel, 'Go test')
+  // Not detected: the deployment's config chose it.
+  assert.equal(started.detectReason, null)
+  assert.equal(fake.last().command, 'go')
+})
+
+test('an explicit runner builds that runner argv instead of go test', () => {
+  const fake = fakeSpawn()
+  const hub = createHub(config({ runner: 'vitest' }), { spawn: fake.spawn })
+  const started = hub.start({ targets: ['tests/'], pattern: 'calc add' })
+  assert.equal(started.runner, 'vitest')
+  assert.equal(fake.last().command, 'pnpm')
+  assert.deepEqual(started.args, ['exec', 'vitest', 'run', '-t=calc add', 'tests/'])
+  // No timeout flag: the host wall clock is not vitest's `-timeout`.
+  assert.equal(started.args.includes('-timeout=900s'), false)
+
+  // An explicit per-call runner wins over the configured one.
+  const pytest = hub.start({ runner: 'pytest', targets: ['tests/test_calc.py::test_add'] })
+  assert.equal(pytest.runner, 'pytest')
+  assert.equal(fake.last().command, 'pytest')
+  assert.deepEqual(pytest.args, ['tests/test_calc.py::test_add'])
+})
+
+test('runner: auto detects the runner from the spawn directory', () => {
+  const dir = tempDir()
+  try {
+    writeFileSync(join(dir, 'go.mod'), 'module example.com/x\n')
+    const fake = fakeSpawn()
+    const hub = createHub(config({ runner: 'auto', cwd: dir }), { spawn: fake.spawn })
+    const started = hub.start({})
+    assert.equal(started.runner, 'go')
+    assert.match(started.detectReason, /go\.mod/)
+    assert.deepEqual(started.args, ['test', '-timeout=900s', './...'])
+
+    // The same configuration shape resolves to pnpm once the project is a
+    // vitest project (`go.mod` wins over `package.json`, so drop it first).
+    rmSync(join(dir, 'go.mod'))
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ devDependencies: { vitest: '^5' } }))
+    const second = createHub(config({ runner: 'auto', cwd: dir }), { spawn: fake.spawn })
+    const detected = second.start({})
+    assert.equal(detected.runner, 'vitest')
+    assert.match(detected.detectReason, /vitest/)
+    assert.equal(fake.last().command, 'pnpm')
+    assert.deepEqual(detected.args, ['exec', 'vitest', 'run'])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('the script runner is refused until allowScriptRunners is on', () => {
+  const hub = createHub(config({ runner: 'script' }), { spawn: () => assert.fail('must not spawn') })
+  assert.throws(() => hub.start({}), /allowScriptRunners: true/)
+  // Nothing was registered: a refused run must not leave a phantom row.
+  assert.deepEqual(hub.list(), [])
+
+  const fake = fakeSpawn()
+  const allowed = createHub(config({ runner: 'script', allowScriptRunners: true }), { spawn: fake.spawn })
+  const started = allowed.start({})
+  assert.equal(started.runner, 'script')
+  assert.equal(fake.last().command, 'pnpm')
+  assert.deepEqual(started.args, ['test', '--'])
+})
+
+test('generic keeps command and baseArgs verbatim and appends no flags', () => {
+  const fake = fakeSpawn()
+  const hub = createHub(config({ kind: 'command', command: '/usr/bin/make', baseArgs: ['test'] }), {
+    spawn: fake.spawn,
+  })
+  const started = hub.start({ pattern: 'ignored', verbose: true, race: true, packages: ['./...'] })
+  assert.equal(started.runner, 'generic')
+  assert.equal(fake.last().command, '/usr/bin/make')
+  assert.deepEqual(started.args, ['test'])
+})
+
+test('an unknown runner is rejected before anything is spawned', () => {
+  const hub = createHub(config({}), { spawn: () => assert.fail('must not spawn') })
+  assert.throws(() => hub.start({ runner: 'cargo' }), /not a known runner/)
+  assert.deepEqual(hub.list(), [])
+})
+
+test('the hub exposes its settings and the runner catalog', () => {
+  const hub = createHub(config({ allowScriptRunners: true }), { spawn: fakeSpawn().spawn })
+  assert.equal(hub.settings.runner, 'go')
+  assert.equal(hub.settings.allowScriptRunners, true)
+  const catalog = hub.runners()
+  assert.equal(catalog.length, 7)
+  assert.equal(catalog.find(row => row.id === 'script').available, true)
+  assert.equal(catalog.every(row => typeof row.selectionPlaceholder === 'string'), true)
+})
+
+test('a stored run keeps its runner across a restart', async () => {
+  const dir = tempDir()
+  try {
+    const stateFile = join(dir, 'test-live', 'runs.json')
+    const fake = fakeSpawn()
+    const first = createHub(resolveConfig({ stateFile, runner: 'vitest' }), { spawn: fake.spawn })
+    const started = first.start({ targets: ['tests/'] })
+    fake.last().emit('close', 0, null)
+    await first.waitFor(started.id, 1000)
+    first.dispose()
+
+    const second = createHub(resolveConfig({ stateFile }), { spawn: fakeSpawn().spawn })
+    const restored = second.latest()
+    assert.equal(restored.id, started.id)
+    assert.equal(restored.runner, 'vitest')
+    assert.equal(restored.runnerLabel, 'Vitest')
+    assert.deepEqual(restored.args, ['exec', 'vitest', 'run', 'tests/'])
+    second.dispose()
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a stored summary keyed `packages` is restored under the new bucket name', () => {
+  const dir = tempDir()
+  try {
+    const stateFile = join(dir, 'runs.json')
+    const store = createRunStore({ stateFile })
+    store.save([
+      {
+        id: 'run_legacy',
+        kind: 'command',
+        // Written before descriptors existed: no runner field.
+        status: 'passed',
+        command: 'go',
+        args: ['test', './...'],
+        cwd: dir,
+        startedAt: 1,
+        finishedAt: 2,
+        lastSeq: 1,
+        summary: {
+          packages: { ok: ['pkg/a'], fail: ['pkg/b'], noTest: [] },
+          tests: { pass: 2, fail: 1, skip: 0 },
+          failures: ['TestB'],
+          buildErrors: [],
+          coverage: ['81.2% of statements'],
+        },
+        lines: [{ seq: 1, text: 'ok  \tpkg/a\t0.1s', kind: 'package-ok' }],
+      },
+    ])
+    store.flush()
+
+    const hub = createHub(resolveConfig({ stateFile }), { spawn: () => assert.fail('must not spawn') })
+    const restored = hub.latest()
+    // The command line still identifies the runner of an old record.
+    assert.equal(restored.runner, 'go')
+    // Whichever bucket name the current parser uses, the old counts survive.
+    const buckets = restored.summary.suites ?? restored.summary.packages
+    assert.deepEqual(buckets.ok, ['pkg/a'])
+    assert.deepEqual(buckets.fail, ['pkg/b'])
+    assert.deepEqual(restored.summary.failures, ['TestB'])
+    assert.equal(restored.summary.tests.pass, 2)
+    assert.deepEqual(restored.coverage, ['81.2% of statements'])
     hub.dispose()
   } finally {
     rmSync(dir, { recursive: true, force: true })

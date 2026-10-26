@@ -1,0 +1,12 @@
+============================= test session starts ==============================
+platform linux -- Python 3.14.4, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /tmp/lang-fixtures/pytest
+plugins: typeguard-4.4.4
+collecting ... collected 3 items
+
+tests/test_calc.py::test_add PASSED                                      [ 33%]
+tests/test_calc.py::test_string PASSED                                   [ 66%]
+tests/test_calc.py::test_skipped SKIPPED (demo skip)                     [100%]
+
+========================= 2 passed, 1 skipped in 0.00s =========================

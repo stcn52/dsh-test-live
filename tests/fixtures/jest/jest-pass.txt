@@ -1,0 +1,9 @@
+PASS tests/pass.test.js
+  calc add
+    ✓ adds two numbers (2 ms)
+
+Test Suites: 1 passed, 1 total
+Tests:       1 passed, 1 total
+Snapshots:   0 total
+Time:        0.25 s
+Ran all test suites matching tests/pass.test.js.

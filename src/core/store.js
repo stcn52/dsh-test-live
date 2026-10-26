@@ -87,6 +87,11 @@ export function createRunStore(options = {}) {
         id: run.id,
         kind: run.kind,
         file: run.file ?? null,
+        // Which runner produced the run, so restored history still labels and
+        // summarises itself the way it did when it finished.
+        runner: run.runner ?? null,
+        runnerLabel: run.runnerLabel ?? null,
+        detectReason: run.detectReason ?? null,
         status: run.status,
         command: run.command,
         args: Array.isArray(run.args) ? run.args.map(String) : [],

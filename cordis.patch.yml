@@ -26,8 +26,22 @@
         # call carries no session directory (older host, direct API caller).
         # `null` means "wherever the host process happens to run".
         cwd: null
+        # Which test runner this deployment uses by default.
+        #   'auto'  = detect from the run's working directory each time:
+        #             go.mod -> go, package.json (vitest/jest/node --test) ->
+        #             vitest/jest/nodeTest, pytest markers OR test_*.py files ->
+        #             pytest, anything else -> the custom command below.
+        #   '<id>'  = force one of go | vitest | jest | nodeTest | pytest |
+        #             script | generic.
+        # 'go' is the code-level default so an existing deployment keeps its
+        # exact historical argv; this row opts into detection.
+        runner: 'auto'
+        # `script` runs `pnpm test` (whatever package.json says), i.e. arbitrary
+        # repo code. It is refused unless this is true.
+        allowScriptRunners: false
         # The executable. Only this binary is ever spawned: the HTTP surface
-        # cannot run arbitrary commands.
+        # cannot run arbitrary commands. Used by the `generic` runner and as the
+        # fallback when detection finds nothing.
         command: 'go'
         # Fixed leading arguments; the run options append to these.
         baseArgs: ['test']

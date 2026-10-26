@@ -1,0 +1,4 @@
+=== RUN   TestSkip
+--- SKIP: TestSkip (0.00s)
+PASS
+ok  	github.com/x/y	0.1s
