@@ -413,14 +413,20 @@ export function registerTools(ctx, hub, resolver) {
       // inside the conversation's directory is reachable; anything outside every
       // root still throws and surfaces as a tool error.
       const context = callContext(exec, resolver, 'tool')
+      // The hub records the runner the caller asked the file to be parsed with.
+      // Only an explicit request travels: a follow without one keeps the
+      // historical runner-less record, and the hint computed below stays a
+      // presentation detail (which command to write the log with).
+      const requestedRunner = textOf(options.runner)
+      if (requestedRunner !== null) context.runner = requestedRunner
       const root = selectFollowRoot(hub, context, options.path, undefined)
-      // Read the hint *before* the follow registers its own (runner-less) file
-      // run, or the newest run of the conversation would be the very run this
-      // call is creating.
+      // Read the hint *before* the follow registers its own file run, or the
+      // newest run of the conversation would be the very run this call is
+      // creating.
       const hinted = followRunner(hub, context, options.runner)
       const meta = hub.follow(options.path, root, context)
-      // The hub's own record wins (it may have detected the runner itself); the
-      // written hint then matches the grammar the panel parses the file with.
+      // A runner the hub recorded wins (the caller named it); otherwise the
+      // hint is all this follow has to name the grammar it reads the file with.
       const runnerId = textOf(meta.runner) ?? hinted
       return {
         id: meta.id,

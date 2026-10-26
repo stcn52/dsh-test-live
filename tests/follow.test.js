@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import { resolveConfig } from '../src/core/config.js'
+import { RUNNERS } from '../src/core/runners.js'
 import { createHub, resolveFollowPath } from '../src/core/runner.js'
 
 /**
@@ -127,6 +128,59 @@ test('dispose stops a running follow', async () => {
   const meta = hub.follow('run.log')
   hub.dispose()
   assert.equal(hub.get(meta.id).status, 'canceled')
+})
+
+// ---------------------------------------------------------------------------
+// The runner a follow records.
+//
+// A follow never spawns anything, so `runner` is provenance, not argv: an
+// explicit id names the grammar that parses the file, `auto` cannot be detected
+// without a spawn directory, and a call that names none stays runner-less
+// exactly as before the field existed.
+// ---------------------------------------------------------------------------
+
+test('follow records an explicit runner and parses with its grammar', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-test-live-'))
+  // A pytest result line: the Go grammar would leave it `plain`, so a counted
+  // pass proves the recorded runner is the grammar the reader actually used.
+  await writeFile(join(dir, 'run.log'), 'tests/test_calc.py::test_add PASSED                                      [ 33%]\n', 'utf8')
+  const hub = createHub(testConfig({ followRoot: dir, followIntervalMs: 100 }))
+
+  const meta = hub.follow('run.log', undefined, { runner: 'pytest' })
+  assert.equal(meta.runner, 'pytest')
+  assert.equal(meta.runnerLabel, RUNNERS.pytest.label)
+  assert.equal(meta.detectReason, null)
+  assert.equal(hub.get(meta.id).runner, 'pytest')
+  assert.ok(await waitFor(() => hub.get(meta.id).summary.tests.pass === 1))
+  hub.dispose()
+})
+
+test('follow with runner "auto" records no runner and says why', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-test-live-'))
+  await writeFile(join(dir, 'run.log'), 'x\n', 'utf8')
+  const hub = createHub(testConfig({ followRoot: dir, followIntervalMs: 100 }))
+
+  const meta = hub.follow('run.log', undefined, { runner: 'auto' })
+  // `auto` means "detect it", but a follow builds no argv and inspects no
+  // directory: recording what detection would have guessed would be dishonest.
+  assert.equal(meta.runner, null)
+  assert.equal(meta.runnerLabel, null)
+  assert.match(meta.detectReason, /follow 不执行 runner/)
+  assert.equal(hub.get(meta.id).detectReason, meta.detectReason)
+  hub.dispose()
+})
+
+test('follow without a runner stays runner-less like an old call', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-test-live-'))
+  await writeFile(join(dir, 'run.log'), 'x\n', 'utf8')
+  const hub = createHub(testConfig({ followRoot: dir, followIntervalMs: 100 }))
+
+  const meta = hub.follow('run.log')
+  assert.equal(meta.runner, null)
+  assert.equal(meta.runnerLabel, null)
+  assert.equal(meta.detectReason, null)
+  assert.equal(hub.get(meta.id).runner, null)
+  hub.dispose()
 })
 
 // ---------------------------------------------------------------------------

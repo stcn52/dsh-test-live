@@ -37,6 +37,16 @@ const STORED_STATUSES = new Set(['running', 'passed', 'failed', 'canceled'])
 const MAX_FOLLOW_CHUNK = 1 << 20
 
 /**
+ * Why a followed file whose request said `runner: 'auto'` records no runner.
+ *
+ * A follow tails a file someone else wrote and never builds an argv, so there is
+ * no spawn directory whose evidence detection could read. Recording the host
+ * default (or a guess) would claim a provenance the follow never had, so the run
+ * says it has none and keeps this reason in the meta.
+ */
+const FOLLOW_AUTO_REASON = 'follow 不执行 runner，无法识别'
+
+/**
  * @param value - candidate.
  * @returns the absolute path, or null (a relative cwd would silently resolve
  * against the host's directory and run the tests in the wrong project).
@@ -823,6 +833,25 @@ export function createHub(settings, deps = {}) {
   }
 
   /**
+   * The runner fields a follow records, read from the caller's context.
+   *
+   * The vocabulary is {@link start}'s — a concrete id is recorded with its label
+   * — except for `'auto'`: a follow runs no process, so detection has no argv to
+   * inspect, and the run records no runner while the reason stays in the meta.
+   * A call that names no runner records none, exactly as before the field
+   * existed.
+   * @param context - raw follow context (the ownership fields plus `runner`).
+   * @returns `{ runner, runnerLabel, detectReason }`.
+   */
+  function followRunnerFields(context) {
+    const requested = textOrNull(context?.runner)
+    if (requested === null) return { runner: null, runnerLabel: null, detectReason: null }
+    if (requested === 'auto') return { runner: null, runnerLabel: null, detectReason: FOLLOW_AUTO_REASON }
+    const label = Object.hasOwn(RUNNERS, requested) ? RUNNERS[requested].label : null
+    return { runner: requested, runnerLabel: label, detectReason: null }
+  }
+
+  /**
    * Follow a log file written by someone else (terminal, bash, CI).
    *
    * The file is polled; every complete line goes through the same buffer,
@@ -830,7 +859,8 @@ export function createHub(settings, deps = {}) {
    * There is no exit code to observe: the run stays `running` until cancelled.
    * @param inputPath - path inside one of the roots this call is allowed to read.
    * @param root - optional root to resolve against; must be allowed.
-   * @param context - run ownership; its cwd widens the allow-list for this call.
+   * @param context - run ownership; its cwd widens the allow-list for this call,
+   *   and its optional `runner` says which grammar parses the file.
    * @returns run meta.
    */
   function follow(inputPath, root, context) {
@@ -839,6 +869,9 @@ export function createHub(settings, deps = {}) {
     const run = createRun({
       ...owner,
       kind: 'file',
+      // The same three fields `start()` writes; `baseRun` also uses `runner` for
+      // the summary grammar, so an explicit id parses the file with its grammar.
+      ...followRunnerFields(context),
       command: file,
       // A followed log lives where the file is, whatever the session cwd is.
       cwd: dirname(file),

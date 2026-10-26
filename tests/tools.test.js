@@ -532,3 +532,25 @@ test('test_live_follow follows the runner of the newest run of the conversation'
   assert.match(value.text, /^write with: node --test 2>&1 \| tee /m)
   real.dispose()
 })
+
+test('test_live_follow records the runner it was asked to parse with', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-test-live-tool-'))
+  await writeFile(join(dir, 'run.log'), 'ok\n', 'utf8')
+  const real = createHub(testConfig({ followRoot: dir, followIntervalMs: 100 }))
+  const tools = collectWith(real, stubResolver())
+  const follow = args => tools.get('test_live_follow').execute(args, {})
+
+  const pytest = follow({ path: 'run.log', runner: 'pytest' })
+  assert.equal(real.get(pytest.id).runner, 'pytest')
+
+  // `auto` on a follow is honestly unresolved: there is no argv to detect from.
+  const auto = follow({ path: 'run.log', runner: 'auto' })
+  assert.equal(real.get(auto.id).runner, null)
+  assert.match(real.get(auto.id).detectReason, /follow 不执行 runner/)
+
+  // The historical call keeps the runner-less record it always had.
+  const bare = follow({ path: 'run.log' })
+  assert.equal(real.get(bare.id).runner, null)
+  assert.equal(real.get(bare.id).detectReason, null)
+  real.dispose()
+})

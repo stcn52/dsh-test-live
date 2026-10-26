@@ -775,6 +775,13 @@ async function handle(req, res, hub, resolver) {
       // is still refused (the hub throws, this becomes the 400).
       const namedRoot = typeof body.root === 'string' && body.root.trim() !== '' ? body.root.trim() : undefined
       const context = sessionContext(resolver, body.sessionId, 'panel')
+      // `runner` names the grammar that parses the followed file. It is checked
+      // exactly like a run request (same 400 wording as POST /run), and it only
+      // travels when the caller named one: a follow without it stays
+      // runner-less, the record shape it has always had.
+      if (body.runner !== undefined) checkRunRequest(hub, { runner: body.runner })
+      const requestedRunner = trimId(body.runner)
+      if (requestedRunner !== null) context.runner = requestedRunner
       const root = selectFollowRoot(hub, context, body.path, namedRoot)
       return sendJson(res, 202, hub.follow(body.path, root, context))
     } catch (error) {

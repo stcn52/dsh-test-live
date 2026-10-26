@@ -572,6 +572,37 @@ test('POST /follow keeps an explicit root but never widens it', async () => {
   assert.equal(hub.calls.follow[0].root, '/srv/elsewhere')
 })
 
+test('POST /follow passes an explicit runner so the hub can record it', async () => {
+  const hub = stubHub()
+  const route = mountStub(hub, stubResolver())
+
+  const pytest = await callRoute(route, 'POST', '/test-live/follow', { path: 'run.log', runner: 'pytest' })
+  assert.equal(pytest.statusCode, 202)
+  assert.deepEqual(hub.calls.follow[0].context, {
+    sessionId: null,
+    sessionLabel: null,
+    cwd: null,
+    origin: 'panel',
+    runner: 'pytest',
+  })
+
+  // `auto` travels verbatim: only the hub knows a follow cannot detect one.
+  const auto = await callRoute(route, 'POST', '/test-live/follow', { path: 'run.log', runner: 'auto' })
+  assert.equal(auto.statusCode, 202)
+  assert.equal(hub.calls.follow[1].context.runner, 'auto')
+})
+
+test('POST /follow refuses an unknown runner with the /run wording', async () => {
+  const hub = stubHub()
+  const route = mountStub(hub, stubResolver())
+
+  const res = await callRoute(route, 'POST', '/test-live/follow', { path: 'run.log', runner: 'cargo' })
+
+  assert.equal(res.statusCode, 400)
+  assert.match(JSON.parse(res.body()).error, /unknown runner "cargo"/)
+  assert.equal(hub.calls.follow.length, 0, 'nothing is registered when the runner is refused')
+})
+
 test('a conversation does not widen the follow roots enough to escape every root', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-test-live-route-'))
   const { ctx, scopes } = fakeContext()
