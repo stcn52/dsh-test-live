@@ -8,6 +8,8 @@
  * @module dsh-test-live/tools
  */
 
+import { dirname, isAbsolute, resolve } from 'node:path'
+
 import { detectRunner, RUNNERS } from '../core/runners.js'
 import { AUTO_RUNNER, checkRunRequest, selectFollowRoot } from '../host/routes.js'
 
@@ -96,18 +98,66 @@ function writeWith(runnerId) {
 }
 
 /**
+ * The directory the followed log lives in.
+ *
+ * Resolved the way `hub.follow` resolves the path: against the root the call
+ * settled on (for a relative path that root is the conversation directory;
+ * `resolve` collapses an absolute path back to itself). Classification only: an
+ * unknown base or an unusable path returns null and the inference falls through
+ * to the next level, because a hint must never be the reason a follow fails.
+ * @param follow - `{ path, root }` of the call.
+ * @returns an absolute directory, or null when it cannot be computed.
+ */
+function followDirectory(follow) {
+  const wanted = textOf(follow?.path)
+  if (wanted === null) return null
+  const root = textOf(follow?.root)
+  // A relative path with no conversation cwd is resolved by the hub against the
+  // deployment's first follow root, which this layer does not know: do not guess.
+  if (root === null && !isAbsolute(wanted)) return null
+  try {
+    return dirname(root === null ? resolve(wanted) : resolve(root, wanted))
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The runner a directory proves, if it proves one.
+ *
+ * `generic` is the detector's answer for "nothing recognizable here", not
+ * evidence about the log; its grammar counts nothing (src/core/grammars/
+ * index.js), so a log written to a bare directory must not outvote the project
+ * the conversation is actually in. Anything unreadable proves nothing either.
+ * @param dir - absolute directory.
+ * @returns a runner id, or null when the directory is no evidence.
+ */
+function detectedRunnerIn(dir) {
+  try {
+    const id = textOf(detectRunner(dir)?.id)
+    return id === null || id === 'generic' ? null : id
+  } catch {
+    return null
+  }
+}
+
+/**
  * The runner a follow call belongs to.
  *
- * An explicit id wins; otherwise the newest run of the same conversation says
- * which runner this project uses; otherwise the conversation's own directory is
- * detected once. Detection is a hint, never a reason to refuse a follow, so
- * every step degrades to the historical Go wording.
+ * An explicit id wins. Otherwise, in order: the newest run of the same
+ * conversation (what this project was last run as); the directory of the log
+ * itself (a log belongs to the project that wrote it, which is not necessarily
+ * the directory the conversation runs in — a teammate's log under another
+ * checkout was inferred with the conversation's grammar before); the
+ * conversation's own directory; and the historical Go wording. Detection is a
+ * hint, never a reason to refuse a follow, so every step degrades to the next.
  * @param hub - run registry.
  * @param context - conversation ownership.
  * @param requested - `runner` argument of the call, if any.
+ * @param follow - `{ path, root }` of the file being followed.
  * @returns a runner id.
  */
-function followRunner(hub, context, requested) {
+function followRunner(hub, context, requested, follow = {}) {
   const explicit = textOf(requested)
   if (explicit !== null && explicit !== AUTO_RUNNER) return { id: explicit, reason: null }
   const sessionId = context?.sessionId ?? null
@@ -119,6 +169,11 @@ function followRunner(hub, context, requested) {
   }
   const fromRun = textOf(latest?.runner)
   if (fromRun !== null) return { id: fromRun, reason: '沿用本对话最近一次运行的 runner' }
+  const logDir = followDirectory(follow)
+  if (logDir !== null) {
+    const fromLogDir = detectedRunnerIn(logDir)
+    if (fromLogDir !== null) return { id: fromLogDir, reason: '按日志所在目录探测到的 runner' }
+  }
   const cwd = textOf(context?.cwd)
   if (cwd !== null) {
     try {
@@ -399,7 +454,7 @@ export function registerTools(ctx, hub, resolver) {
           enum: [AUTO_RUNNER, ...Object.keys(RUNNERS)],
           description:
             'Runner whose grammar parses the file. Defaults to the newest run of this conversation, ' +
-            'else what the conversation directory detects.',
+            'else what the log\u2019s own directory detects, else what the conversation directory detects.',
         },
       },
       required: ['path'],
@@ -427,8 +482,9 @@ export function registerTools(ctx, hub, resolver) {
       const root = selectFollowRoot(hub, context, options.path, undefined)
       // Read the hint *before* the follow registers its own file run, or the
       // newest run of the conversation would be the very run this call is
-      // creating.
-      const hinted = followRunner(hub, context, options.runner)
+      // creating. The hint also reads the log's own directory, so it needs the
+      // path and the root the follow is about to use.
+      const hinted = followRunner(hub, context, options.runner, { path: options.path, root })
       // The hub records what parses the file: an explicit id as-is, `auto` as the
       // inference above (with its reason), so the counters match the log.
       if (requestedRunner === null || requestedRunner === AUTO_RUNNER) {

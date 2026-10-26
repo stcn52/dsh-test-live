@@ -521,6 +521,9 @@ test('test_live_follow spells the write-with command for the current runner', as
 test('test_live_follow follows the runner of the newest run of the conversation', async () => {
   const fake = fakeSpawn()
   const dir = await mkdtemp(join(tmpdir(), 'dsh-test-live-tool-'))
+  // The log's own directory says vitest, so the assertion below also pins the
+  // order: what this conversation last ran wins over any directory detection.
+  await writeFile(join(dir, 'package.json'), JSON.stringify({ devDependencies: { vitest: '^4.0.0' } }), 'utf8')
   await writeFile(join(dir, 'run.log'), 'ok\n', 'utf8')
   const real = createHub(testConfig({ followRoot: dir, followIntervalMs: 100 }), { spawn: fake.spawn })
   const tools = collectWith(real, stubResolver({ s1: { sessionId: 's1', sessionLabel: '修复登录', cwd: dir } }))
@@ -529,8 +532,57 @@ test('test_live_follow follows the runner of the newest run of the conversation'
   const value = tools.get('test_live_follow').execute({ path: 'run.log' }, execIn('s1'))
 
   assert.equal(value.runner, 'nodeTest')
+  assert.match(real.get(value.id).detectReason, /最近一次运行/)
   assert.match(value.text, /^write with: node --test 2>&1 \| tee /m)
   real.dispose()
+})
+
+test('test_live_follow infers the runner from the log\u2019s own directory, not the conversation cwd', async () => {
+  // The conversation runs in a `node --test` project, but the log was written by
+  // a teammate's vitest checkout elsewhere: the file belongs to that project, so
+  // its grammar — not the conversation's — has to parse the lines.
+  const sessionDir = await mkdtemp(join(tmpdir(), 'dsh-test-live-node-'))
+  await writeFile(join(sessionDir, 'package.json'), JSON.stringify({ scripts: { test: 'node --test' } }), 'utf8')
+  const logDir = await mkdtemp(join(tmpdir(), 'dsh-test-live-vitest-'))
+  await writeFile(join(logDir, 'package.json'), JSON.stringify({ devDependencies: { vitest: '^4.1.8' } }), 'utf8')
+  await writeFile(join(logDir, 'fulltest.log'), '\u2713 tests/a.test.js (3 tests)\n', 'utf8')
+  const resolver = stubResolver({ s1: { sessionId: 's1', sessionLabel: '修复登录', cwd: sessionDir } })
+  const real = createHub(testConfig({
+    followRoot: sessionDir,
+    followRoots: [sessionDir, logDir],
+    followIntervalMs: 100,
+  }))
+  const tools = collectWith(real, resolver)
+
+  const value = await tools.get('test_live_follow').execute(
+    { path: join(logDir, 'fulltest.log'), runner: 'auto' },
+    execIn('s1'),
+  )
+
+  const meta = real.get(value.id)
+  assert.equal(meta.runner, 'vitest')
+  assert.match(meta.detectReason, /日志所在目录/)
+  real.dispose()
+
+  // A log in a directory that proves nothing is no evidence at all: the
+  // detector's `generic` answer counts nothing, so the inference must fall
+  // through to the conversation's project instead of recording it.
+  const bareDir = await mkdtemp(join(tmpdir(), 'dsh-test-live-stray-'))
+  await writeFile(join(bareDir, 'stray.log'), 'ok\n', 'utf8')
+  const second = createHub(testConfig({
+    followRoot: sessionDir,
+    followRoots: [sessionDir, bareDir],
+    followIntervalMs: 100,
+  }))
+  const secondTools = collectWith(second, resolver)
+  const stray = await secondTools.get('test_live_follow').execute(
+    { path: join(bareDir, 'stray.log'), runner: 'auto' },
+    execIn('s1'),
+  )
+  const strayRun = second.get(stray.id)
+  assert.equal(strayRun.runner, 'nodeTest')
+  assert.match(strayRun.detectReason, /对话目录/)
+  second.dispose()
 })
 
 test('test_live_follow records the runner it was asked to parse with', async () => {

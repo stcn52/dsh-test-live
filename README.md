@@ -231,7 +231,7 @@ SSE 每行是一个 `data: {"seq":N,"text":"...","kind":"...","provisional":fals
 | `test_live_run` | 启动运行后**立即返回** run id（不占用对话）；运行归属**调用它的对话**、在该对话的 cwd 里执行。可用 `runner` 选 `auto` 或某个 id，`targets` 的含义随 runner 变（Go 包模式 / JS 文件 / pytest nodeid），`packages` 是 `targets` 的旧别名，`flags` 按描述符 id 给开关，`pattern` 是该 runner 的用例名过滤；`verbose` / `race` / `count` 是旧别名，只在当前 runner 有同名开关时生效。`timeoutSec` 是墙钟上限，`tail` 回带日志尾部（默认 120 行）。`wait:true` 才等结束（`waitSec` 默认 60、上限 300，等待可被取消打断） |
 | `test_live_status` | 读某次运行的状态、计数、失败用例与日志尾部（`tail`，默认 120 行）；报告里有一行 `runner:`，说明这份计数是哪套语法算出来的（没有记录的运行写 `runner: not recorded`）。默认读**本对话**最新一次；`sessionId` 读别的对话，`id` 读指定一次 |
 | `test_live_runs` | 列出最近的运行（新的在前）：状态、耗时、所属对话、目录、汇总。默认列**全部对话**（`sessionId` 只看某个对话），`limit` 默认 10、上限 100，`tail` 默认 0（最多回带 200 行） |
-| `test_live_follow` | 跟随一个日志文件（`path`，外部命令写入），立即返回 run id；路径须在「配置根 + 本对话目录」内。可传 `runner` 指定跟随的 runner；不传（或传 `auto`）时按「本对话最近一次运行的 runner → 目录识别 → 默认 runner」推断，并在记录里写明推断来源。跟随运行**记录**它用的 runner，因为它决定这份日志按哪套语法统计计数（否则 vitest/pytest 的日志会被 Go 语法算错） |
+| `test_live_follow` | 跟随一个日志文件（`path`，外部命令写入），立即返回 run id；路径须在「配置根 + 本对话目录」内。可传 `runner` 指定跟随的 runner；不传（或传 `auto`）时按「本对话最近一次运行的 runner → **日志所在目录**的识别结果 → 对话目录的识别结果 → 默认 runner」推断，并在记录里写明推断来源（日志属于它自己那个项目，所以先看它所在目录）。跟随运行**记录**它用的 runner，因为它决定这份日志按哪套语法统计计数（否则 vitest/pytest 的日志会被 Go 语法算错） |
 | `test_live_cancel` | 停止运行或停止跟随。`{id}` 停指定一次；不给 `id` 就停**本对话**最新那次（`sessionId` 可指向别的对话），不会误停别的对话的运行；对整组发 SIGTERM |
 
 ## 已知限制
