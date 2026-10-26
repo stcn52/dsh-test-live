@@ -8,21 +8,54 @@
  * @module dsh-test-live/config
  */
 
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
+/**
+ * Where finished runs are kept when the deployment does not name a file.
+ *
+ * The registry is fleet-wide, so the file lives under the DSH home (`DSH_HOME`
+ * when the host sets it, else `~/.dsh`) rather than under one project.
+ * @returns absolute path of the state file.
+ */
+export function defaultStateFile() {
+  const home = typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME !== '' ? process.env.DSH_HOME : join(homedir(), '.dsh')
+  return join(home, 'test-live', 'runs.json')
+}
+
 /** Defaults; the patch file mirrors these values so a deployment edit is obvious. */
 export const DEFAULTS = {
   // 'go-test' derives -v/-race/-run/-timeout and package patterns; 'command'
   // runs exactly `command + baseArgs` and ignores those options.
   kind: 'go-test',
+  // The run directory is only a *fallback*: a run belongs to the conversation
+  // that started it, and the session's own cwd wins whenever there is one.
   cwd: null,
   command: 'go',
   baseArgs: ['test'],
   env: {},
-  maxRuns: 8,
+  // In-memory history: how many runs the panel can page through.
+  maxRuns: 30,
+  // Durable history: how many runs / how many tail lines per run reach the disk.
+  historyRuns: 100,
+  historyLines: 200,
+  // '' means "derive from defaultStateFile()" (one file for the whole host);
+  // an explicit `stateFile: null` (or false) disables persistence, and a string
+  // names an absolute file. The DEFAULTS row spells the enabled case so copying
+  // it cannot silently turn history off.
+  stateFile: '',
+  // Which slice of the log the panel opens on: every conversation, or this one.
+  defaultScope: 'all',
   maxLines: 20000,
   defaultTimeoutSec: 900,
   // The file-follow mode: an external writer (terminal, bash, CI) tees into a
   // file; the panel tails it. followRoot bounds which files may be read.
   followRoot: null,
+  // Ordered allow-list of roots the panel may follow files in; the panel shows
+  // them as a picker. `followRoot` is its single-value alias, so a deployment
+  // that only knows the old key keeps its exact historical behavior, and an
+  // empty list means "the historical root" (followRoot, else cwd).
+  followRoots: [],
   followIntervalMs: 300,
   ui: { autoScroll: true, packagesPlaceholder: './...' },
 }
@@ -35,6 +68,8 @@ export const DEFAULTS = {
 export function resolveConfig(raw) {
   const config = raw ?? {}
   const kind = config.kind === 'command' ? 'command' : 'go-test'
+  const followRoot =
+    typeof config.followRoot === 'string' && config.followRoot.trim() !== '' ? config.followRoot.trim() : null
   const settings = {
     kind,
     cwd: typeof config.cwd === 'string' && config.cwd.trim() !== '' ? config.cwd.trim() : null,
@@ -43,8 +78,18 @@ export function resolveConfig(raw) {
     env: isPlainObject(config.env) ? normalizeEnv(config.env) : {},
     maxRuns: positiveInt(config.maxRuns, DEFAULTS.maxRuns, 1, 100),
     maxLines: positiveInt(config.maxLines, DEFAULTS.maxLines, 100, 200000),
+    historyRuns: positiveInt(config.historyRuns, DEFAULTS.historyRuns, 1, 1000),
+    historyLines: positiveInt(config.historyLines, DEFAULTS.historyLines, 10, 2000),
+    stateFile:
+      config.stateFile === null || config.stateFile === false
+        ? null
+        : typeof config.stateFile === 'string' && config.stateFile.trim() !== ''
+          ? config.stateFile.trim()
+          : defaultStateFile(),
+    defaultScope: config.defaultScope === 'session' ? 'session' : 'all',
     defaultTimeoutSec: positiveInt(config.defaultTimeoutSec, DEFAULTS.defaultTimeoutSec, 1, 24 * 3600),
-    followRoot: typeof config.followRoot === 'string' && config.followRoot.trim() !== '' ? config.followRoot.trim() : null,
+    followRoot,
+    followRoots: normalizeRoots(config.followRoots, followRoot),
     followIntervalMs: positiveInt(config.followIntervalMs, DEFAULTS.followIntervalMs, 100, 5000),
     ui: {
       autoScroll: config.ui?.autoScroll !== false,
@@ -63,7 +108,36 @@ export function resolveConfig(raw) {
   if (!isRelativeCwd(settings.followRoot)) {
     throw new Error(`dsh-test-live: config.followRoot "${settings.followRoot}" must be an absolute path`)
   }
+  if (settings.stateFile !== null && !isRelativeCwd(settings.stateFile)) {
+    throw new Error(`dsh-test-live: config.stateFile "${settings.stateFile}" must be an absolute path or null`)
+  }
+  for (const root of settings.followRoots) {
+    if (!isRelativeCwd(root)) {
+      throw new Error(`dsh-test-live: config.followRoots "${root}" must be an absolute path`)
+    }
+  }
   return Object.freeze(settings)
+}
+
+/**
+ * Fold `followRoot` and `followRoots` into one ordered allow-list. The legacy
+ * single root comes first because it is the historical default for relative
+ * paths; duplicates collapse so a profile may set both keys without surprises.
+ * @param value - the `followRoots` config value (may be anything).
+ * @param alias - the normalized `followRoot` value, or null.
+ * @returns absolute root strings, alias first.
+ */
+export function normalizeRoots(value, alias) {
+  const roots = []
+  const push = candidate => {
+    if (typeof candidate !== 'string') return
+    const trimmed = candidate.trim()
+    if (trimmed === '' || roots.includes(trimmed)) return
+    roots.push(trimmed)
+  }
+  push(alias)
+  if (Array.isArray(value)) for (const candidate of value) push(candidate)
+  return roots
 }
 
 /**

@@ -1,8 +1,11 @@
 /**
  * dsh-test-live — live test logs in the DeepSeek Harness sidebar.
  *
- * One run registry feeds three surfaces: the sidebar panel (SSE), the HTTP
- * routes the panel talks to, and three tools the model can call. The plugin
+ * One host-wide run registry feeds three surfaces: the sidebar panel (SSE), the
+ * HTTP routes the panel talks to, and four tools the model can call. A run
+ * belongs to the conversation that started it (session id, title and cwd) rather
+ * than to a project directory, so one panel lists every conversation's tests.
+ * The plugin
  * imports nothing from `@deepseek-ai/*`: it consumes the `tools` and
  * `webServer` services and Node built-ins only, so it loads from a profile
  * without peer resolution.
@@ -11,6 +14,7 @@
 
 import { resolveConfig } from './core/config.js'
 import { createHub } from './core/runner.js'
+import { createSessionResolver } from './core/session.js'
 import { registerRoutes } from './host/routes.js'
 import { registerTools } from './tools/index.js'
 
@@ -37,11 +41,16 @@ export function apply(ctx, config) {
     if (typeof ctx.logger?.warn === 'function') ctx.logger.warn(`dsh-test-live: ${message}; using defaults`)
     settings = resolveConfig({})
   }
+  // One hub per host: every conversation shares it, and it replays its stored
+  // history (stateFile) before the first request arrives.
   const hub = createHub(settings)
+  // The host holds the conversation identity; the resolver only reads it and
+  // degrades to nulls on a host without those services.
+  const resolver = createSessionResolver(ctx)
   // Kill any lingering child when the plugin is unloaded; a running test process
   // outliving its panel would be a leaked process with no way to stop it.
   ctx.effect(() => () => hub.dispose())
-  registerTools(ctx, hub)
+  registerTools(ctx, hub, resolver)
   // Profiles without a web server (headless, SDK) simply keep the tools.
-  registerRoutes(ctx, hub)
+  registerRoutes(ctx, hub, resolver)
 }

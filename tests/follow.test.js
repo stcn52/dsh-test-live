@@ -111,3 +111,62 @@ test('dispose stops a running follow', async () => {
   hub.dispose()
   assert.equal(hub.get(meta.id).status, 'canceled')
 })
+
+// ---------------------------------------------------------------------------
+// Conversation ownership: a follow started from a conversation may read that
+// conversation's own project, and nothing else.
+// ---------------------------------------------------------------------------
+
+test('a conversation adds its own cwd to the follow roots', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-test-live-root-'))
+  const sessionDir = await mkdtemp(join(tmpdir(), 'dsh-test-live-session-'))
+  await writeFile(join(sessionDir, 'run.log'), 'ok  \tpkg/a\t0.1s\n', 'utf8')
+  const hub = createHub(resolveConfig({ followRoot: root, followIntervalMs: 100 }))
+  const context = { sessionId: 's1', sessionLabel: '修复登录', cwd: sessionDir, origin: 'panel' }
+
+  const roots = hub.followRootsFor(context)
+  assert.ok(roots.includes(root), 'the configured root stays allowed')
+  assert.ok(roots.includes(sessionDir), 'the conversation cwd joins the allow-list')
+
+  const meta = hub.follow(join(sessionDir, 'run.log'), sessionDir, context)
+  assert.equal(meta.kind, 'file')
+  assert.equal(meta.sessionId, 's1')
+  assert.equal(meta.sessionLabel, '修复登录')
+  assert.equal(meta.origin, 'panel')
+  assert.ok(await waitFor(() => hub.linesSince(meta.id, -1).some(entry => entry.text.startsWith('ok  '))))
+  hub.dispose()
+})
+
+test('the widened roots change nothing without a context', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-test-live-root-'))
+  const hub = createHub(resolveConfig({ followRoot: root }))
+  assert.deepEqual(hub.followRootsFor(undefined), hub.roots())
+  assert.deepEqual(hub.followRootsFor({}), hub.roots())
+  hub.dispose()
+})
+
+test('a conversation cannot follow outside every root', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-test-live-root-'))
+  const sessionDir = await mkdtemp(join(tmpdir(), 'dsh-test-live-session-'))
+  const hub = createHub(resolveConfig({ followRoot: root }))
+  const context = { sessionId: 's1', sessionLabel: '修复登录', cwd: sessionDir, origin: 'panel' }
+
+  // The wording is what the panel's error box shows and what the routes turn
+  // into a 400, so it is asserted, not just the throw.
+  assert.throws(() => hub.follow('../../etc/passwd', undefined, context), /outside/)
+  assert.throws(() => hub.follow('/etc/passwd', undefined, context), /outside/)
+  assert.throws(() => hub.follow(join(sessionDir, 'run.log'), undefined, { ...context, cwd: null }), /outside/)
+  assert.equal(hub.list().length, 0)
+  hub.dispose()
+})
+
+test('a follow without a context records no conversation', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-test-live-'))
+  await writeFile(join(dir, 'run.log'), 'x\n', 'utf8')
+  const hub = createHub(resolveConfig({ followRoot: dir, followIntervalMs: 100 }))
+  const meta = hub.follow('run.log')
+  assert.equal(meta.sessionId, null)
+  assert.equal(meta.sessionLabel, null)
+  assert.equal(meta.archived, false)
+  hub.dispose()
+})

@@ -61,6 +61,13 @@ window.__ModuleLoader__.load({
       '.dtl-empty { padding: 18px 14px; color: var(--fg-muted, #98a2b3); display: grid; gap: 8px; line-height: 1.6; }',
       '.dtl-empty code { color: var(--fg, #e6e9ef); font-family: var(--mono, ui-monospace, monospace); }',
       '.dtl-error { margin: 6px 10px; padding: 6px 9px; border: 1px solid #6d3a3a; background: #2a1c1e; color: #ff8a80; border-radius: 7px; font-size: 11.5px; }',
+      '.dtl-filter { padding: 4px 10px; }',
+      '.dtl-filter .dtl-filter-label { font-size: 11px; color: var(--fg-muted, #98a2b3); white-space: nowrap; }',
+      '.dtl-bar button.dtl-seg { padding: 2px 9px; font-size: 11.5px; border-radius: 999px; opacity: 0.72; }',
+      '.dtl-bar button.dtl-seg.is-active { opacity: 1; color: var(--fg, #e6e9ef); background: var(--accent-soft, rgba(110,168,254,0.22)); border-color: var(--accent, #6ea8fe); }',
+      '.dtl-select { font: inherit; font-size: 11.5px; color: inherit; background: var(--surface-2, #1b202a); border: 1px solid var(--border, #2a2f3a); border-radius: 7px; padding: 3px 6px; max-width: 220px; }',
+      '.dtl-run-session { white-space: nowrap; font-size: 10.5px; color: var(--fg-muted, #98a2b3); opacity: 0.85; }',
+      '.dtl-run-hist { color: #c3a6ff; }',
     ].join('\n')
 
     /** Inject the tab stylesheet once. */
@@ -138,6 +145,58 @@ window.__ModuleLoader__.load({
       return String(id || '').replace(/^run_/, '')
     }
 
+    /** A conversation id without its "ses_" prefix, for unnamed conversations. */
+    function shortSessionId(id) {
+      return String(id || '').replace(/^(session|sess|ses)_/, '').slice(0, 8)
+    }
+
+    /**
+     * Display label of one conversation: the host title when there is one,
+     * otherwise a short id. Never throws on a missing or partial record.
+     */
+    function sessionLabelText(id, label) {
+      if (label) return String(label)
+      if (!id) return '未知对话'
+      return '对话 ' + shortSessionId(id)
+    }
+
+    /** The id field of a session record; the host and the routes disagree on the name. */
+    function sessionIdOf(item) {
+      if (!item) return null
+      return item.id || item.sessionId || null
+    }
+
+    /** Look one conversation up in the list the host returned. */
+    function findSession(sessions, id) {
+      if (!id || !sessions || sessions.length === 0) return null
+      for (var i = 0; i < sessions.length; i++) {
+        if (sessionIdOf(sessions[i]) === id) return sessions[i]
+      }
+      return null
+    }
+
+    /** Label for a run's conversation, preferring the session list over the run's own copy. */
+    function labelForSession(sessions, id, fallbackLabel) {
+      var found = findSession(sessions, id)
+      if (found) return sessionLabelText(id, found.label || found.sessionLabel)
+      return sessionLabelText(id, fallbackLabel)
+    }
+
+    /** Shorten a chip label without cutting mid-character. */
+    function clip(text, max) {
+      var value = text === null || text === undefined ? '' : String(text)
+      if (value.length <= max) return value
+      return value.slice(0, max - 1) + '…'
+    }
+
+    /** The "/runs" query for one view; a session view without a session is "all". */
+    function runsUrl(scope, sessionId) {
+      var bySession = scope === 'session' && Boolean(sessionId)
+      var url = ROUTE + '/runs?scope=' + (bySession ? 'session' : 'all')
+      if (bySession) url += '&sessionId=' + encodeURIComponent(sessionId)
+      return url
+    }
+
     /** One rendered log line. */
     function LogLine(props) {
       var line = props.line
@@ -156,7 +215,15 @@ window.__ModuleLoader__.load({
     }
 
     /** The sidebar panel. */
-    function TestLiveBody() {
+    function TestLiveBody(props) {
+      // The sidebar slot may render us with no props at all, so never trust the
+      // shape: a `props.sessionId` that is missing just means "all conversations".
+      var safeProps = props && typeof props === 'object' ? props : {}
+      var injectedSessionId =
+        typeof safeProps.sessionId === 'string' && safeProps.sessionId !== ''
+          ? safeProps.sessionId
+          : null
+
       var runsState = React.useState([])
       var runs = runsState[0]
       var setRuns = runsState[1]
@@ -180,6 +247,23 @@ window.__ModuleLoader__.load({
       var busyState = React.useState(false)
       var busy = busyState[0]
       var setBusy = busyState[1]
+      // Which layer of the log is on screen: every conversation, or one of them.
+      var scopePref = readPref('dsh-test-live:scope', null)
+      var scopeState = React.useState(scopePref === 'session' && injectedSessionId !== null ? 'session' : 'all')
+      var scope = scopeState[0]
+      var setScope = scopeState[1]
+      // The conversation picked in the dropdown; null means "the hosting one".
+      var targetState = React.useState(null)
+      var targetSession = targetState[0]
+      var setTargetSession = targetState[1]
+      var sessionsState = React.useState([])
+      var sessions = sessionsState[0]
+      var setSessions = sessionsState[1]
+      // True once the user (or a stored preference) chose a view: only then may the
+      // panel ignore the host's defaultScope.
+      var scopeChosenRef = React.useRef(scopePref === 'session' || scopePref === 'all')
+      // scope=session 时真正过滤的对话：下拉里选的，否则就是本对话。
+      var activeSessionId = scope === 'session' ? targetSession || injectedSessionId : null
       var autoState = React.useState(readPref('dsh-test-live:autoScroll', true))
       var autoScroll = autoState[0]
       var setAutoScroll = autoState[1]
@@ -232,21 +316,44 @@ window.__ModuleLoader__.load({
         if (el) el.scrollLeft = 0
       }, [runs])
 
-      /** Load the run list. */
-      var refreshRuns = React.useCallback(function () {
-        return requestJson(ROUTE + '/runs').then(function (body) {
-          var list = body && body.runs ? body.runs : []
+      /**
+       * Load the run list plus the conversation roster for one view.
+       * Passing the view explicitly lets the click handler fetch before the state
+       * from that click has been rendered.
+       */
+      var refreshRuns = React.useCallback(function (scopeArg, sessionArg) {
+        var useScope = scopeArg === 'session' || scopeArg === 'all' ? scopeArg : scope
+        var useSession = useScope === 'session' ? sessionArg || activeSessionId || null : null
+        return requestJson(runsUrl(useScope, useSession)).then(function (body) {
+          var list = body && Array.isArray(body.runs) ? body.runs : []
           setRuns(list)
+          setSessions(body && Array.isArray(body.sessions) ? body.sessions : [])
+          // First screen without a stored choice: follow the host's default view,
+          // unless that view cannot be rendered without a session id.
+          if (!scopeChosenRef.current) {
+            var hostDefault = body && body.defaultScope === 'session' ? 'session' : 'all'
+            if (hostDefault === 'session' && !injectedSessionId) hostDefault = 'all'
+            if (hostDefault !== useScope) setScope(hostDefault)
+          }
           return list
         })
-      }, [])
+      }, [scope, activeSessionId, injectedSessionId])
 
-      /** Bind the panel to one run and stream it. */
+      /** Bind the panel to one run and stream it; a null meta clears the view. */
       var openRun = React.useCallback(function (meta) {
-        if (!meta || !meta.id) return
         if (sourceRef.current) {
           sourceRef.current.close()
           sourceRef.current = null
+        }
+        if (!meta || !meta.id) {
+          indexRef.current = {}
+          lastSeqRef.current = 0
+          setLines([])
+          setRun(null)
+          setCurrent(null)
+          setError(null)
+          setConnected(false)
+          return
         }
         indexRef.current = {}
         lastSeqRef.current = 0
@@ -279,19 +386,37 @@ window.__ModuleLoader__.load({
         source.onerror = function () { setConnected(false) }
       }, [ingest, refreshRuns])
 
-      // Initial load: bind to the newest run, preferring a running one.
+      // First screen and every view switch: fetch the list for this view and bind
+      // the newest (running first) run. A manual pin only shields the poll below.
       React.useEffect(function () {
+        var alive = true
         refreshRuns().then(function (list) {
+          if (!alive) return
           var running = null
           for (var i = 0; i < list.length; i++) {
             if (list[i].status === 'running') { running = list[i]; break }
           }
           openRun(running || list[0] || null)
         }).catch(function (loadError) {
-          setError(loadError.message)
+          if (!alive) return
+          setError(loadError && loadError.message ? loadError.message : String(loadError))
         })
         return function () {
-          if (sourceRef.current) sourceRef.current.close()
+          alive = false
+          if (sourceRef.current) {
+            sourceRef.current.close()
+            sourceRef.current = null
+          }
+        }
+      }, [scope, activeSessionId])
+
+      // Close the stream when the whole panel goes away.
+      React.useEffect(function () {
+        return function () {
+          if (sourceRef.current) {
+            sourceRef.current.close()
+            sourceRef.current = null
+          }
         }
       }, [])
 
@@ -330,6 +455,43 @@ window.__ModuleLoader__.load({
         if (node) node.scrollTop = node.scrollHeight
       }, [lines, autoScroll])
 
+      /**
+       * Switch the list between every conversation and one of them.
+       * `sessionId` only matters for scope 'session'; it defaults to this dialog.
+       */
+      function chooseScope(next, sessionId) {
+        var resolved = next === 'session' ? sessionId || injectedSessionId || null : null
+        if (next === 'session' && resolved === null) next = 'all'
+        scopeChosenRef.current = true
+        writePref('dsh-test-live:scope', next)
+        // A new view invalidates the old manual pin.
+        pinnedRef.current = null
+        var sameView = next === scope && (next === 'all' || resolved === activeSessionId)
+        setScope(next)
+        setTargetSession(next === 'session' ? resolved : null)
+        if (sameView) {
+          // Same view as before: state won't change, so refresh by hand.
+          refreshRuns(next, resolved).catch(function () {})
+        }
+      }
+
+      /** Dropdown handler: '' means every conversation. */
+      function chooseSession(event) {
+        var value = event && event.target ? event.target.value : ''
+        if (!value) chooseScope('all')
+        else chooseScope('session', value)
+      }
+
+      /**
+       * A run started here belongs to this dialog. If the list is narrowed to
+       * another conversation, jump back so the new run is actually visible.
+       */
+      function followIntoView() {
+        if (scope !== 'session' || injectedSessionId === null) return
+        if (activeSessionId === injectedSessionId) return
+        chooseScope('session', injectedSessionId)
+      }
+
       /** Start a run with the current options. */
       function startRun() {
         var patterns = packages.split(',').map(function (item) { return item.trim() }).filter(Boolean)
@@ -338,10 +500,12 @@ window.__ModuleLoader__.load({
         requestJson(ROUTE + '/run', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ packages: patterns, verbose: verbose }),
+          // The host files this run under the conversation that asked for it.
+          body: JSON.stringify({ packages: patterns, verbose: verbose, sessionId: injectedSessionId }),
         }).then(function (meta) {
           writePref('dsh-test-live:packages', packages)
           pinnedRef.current = null
+          followIntoView()
           openRun(meta)
           refreshRuns().catch(function () {})
         }).catch(function (startError) {
@@ -358,10 +522,11 @@ window.__ModuleLoader__.load({
         requestJson(ROUTE + '/follow', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ path: target }),
+          body: JSON.stringify({ path: target, sessionId: injectedSessionId }),
         }).then(function (meta) {
           writePref('dsh-test-live:followPath', target)
           pinnedRef.current = null
+          followIntoView()
           openRun(meta)
           refreshRuns().catch(function () {})
         }).catch(function (followError) {
@@ -393,6 +558,12 @@ window.__ModuleLoader__.load({
       var running = run !== null && run.status === 'running'
       var visible = onlyFail ? lines.filter(isFailureLine) : lines
       var summary = run && run.summary ? run.summary : null
+      var viewSummary =
+        scope === 'all'
+          ? runs.length + ' 条 · ' + sessions.length + ' 个对话'
+          : (activeSessionId === injectedSessionId
+              ? '本对话 '
+              : clip(labelForSession(sessions, activeSessionId, null), 12) + ' ') + runs.length + ' 条'
 
       return h('div', { className: 'dtl-root' },
         h('div', { className: 'dtl-bar' },
@@ -474,16 +645,54 @@ window.__ModuleLoader__.load({
           }),
           h('button', { disabled: busy, onClick: startFollow, title: '实时 tail 这个文件（外部命令写入）' }, '跟随'),
         ),
+        h('div', { className: 'dtl-bar dtl-filter' },
+          h('span', { className: 'dtl-filter-label' }, '范围'),
+          h('button', {
+            className: 'dtl-seg' + (scope === 'all' ? ' is-active' : ''),
+            onClick: function () { chooseScope('all') },
+            title: '所有对话的测试记录',
+          }, '全部'),
+          injectedSessionId
+            ? h('button', {
+              className: 'dtl-seg' + (scope === 'session' && activeSessionId === injectedSessionId ? ' is-active' : ''),
+              onClick: function () { chooseScope('session', injectedSessionId) },
+              title: '只看本对话的运行记录',
+            }, '本对话')
+            : null,
+          sessions.length > 1
+            ? h('select', {
+              className: 'dtl-select',
+              value: scope === 'session' ? activeSessionId || '' : '',
+              onChange: chooseSession,
+              title: '按对话筛选',
+            },
+              h('option', { value: '' }, '全部对话'),
+              sessions.map(function (item) {
+                var sid = sessionIdOf(item) || ''
+                var count = typeof item.count === 'number' ? item.count : 0
+                return h('option', { key: sid, value: sid },
+                  sessionLabelText(sid, item.label || item.sessionLabel) + ' · ' + count + ' 条')
+              }),
+            )
+            : null,
+          h('span', { className: 'dtl-grow' }),
+          h('span', { className: 'dtl-check' }, viewSummary),
+        ),
         runs.length > 0
           ? h('div', { className: 'dtl-runs', ref: runsRef }, runs.map(function (item) {
             var packagesOk = item.summary ? item.summary.packages.ok.length : 0
             var failed = item.summary && (item.summary.packages.fail.length > 0 || item.summary.tests.fail > 0)
             var isFile = item.kind === 'file'
+            var cwdPart = item.cwd ? clip(baseName(item.cwd), 16) : ''
             return h('button', {
               key: item.id,
               className: 'dtl-run' + (item.id === current ? ' is-current' : ''),
               'data-status': item.status,
-              title: item.command + ' ' + (item.args || []).join(' ') + '  (' + item.id + ')',
+              'data-archived': item.archived ? 'true' : 'false',
+              title: labelForSession(sessions, item.sessionId, item.sessionLabel) +
+                ' · ' + (item.cwd || '—') +
+                ' · ' + item.command + ' ' + (item.args || []).join(' ') +
+                '  (' + item.id + ')',
               onClick: function () { pickRun(item) },
             },
               h('span', { className: 'dtl-run-id' }, isFile ? '📄 ' + baseName(item.file) : shortId(item.id)),
@@ -491,21 +700,30 @@ window.__ModuleLoader__.load({
                 statusLabel(item.status) + ' · ' +
                 (isFile ? item.buffered + ' 行' : packagesOk + ' 包') +
                 (failed ? ' · 有失败' : '') +
-                (item.durationMs ? ' · ' + durationText(item) : '')),
+                (item.durationMs ? ' · ' + durationText(item) : ''),
+                item.archived ? h('span', { className: 'dtl-run-hist' }, ' · 历史') : null),
+              h('span', { className: 'dtl-run-session' },
+                clip(labelForSession(sessions, item.sessionId, item.sessionLabel), 18) +
+                (cwdPart ? ' · ' + cwdPart : '')),
             )
           }))
           : null,
         error ? h('div', { className: 'dtl-error' }, error) : null,
         run ? h('div', { className: 'dtl-meta' },
           h('div', null, h('code', null, run.command + ' ' + (run.args || []).join(' '))),
-          h('div', null, run.cwd + ' · ' + run.id + ' · ' + durationText(run)),
+          h('div', null,
+            '对话 ' + labelForSession(sessions, run.sessionId, run.sessionLabel) +
+            ' · ' + (run.cwd || '—') +
+            ' · ' + run.id +
+            (durationText(run) ? ' · ' + durationText(run) : '')),
         ) : null,
         run
           ? h('div', { className: 'dtl-log', ref: logRef }, visible.map(function (line) {
             return h(LogLine, { key: line.seq, line: line })
           }))
           : h('div', { className: 'dtl-empty' },
-            h('div', null, '还没有运行记录。'),
+            h('div', null, scope === 'session' ? '这个对话还没有运行记录。' : '还没有运行记录。'),
+            h('div', null, '这里汇总所有对话的测试记录：别的对话里跑完的测试也会出现在这里。'),
             h('div', null, '点「运行」跑 ', h('code', null, 'go test ./...'), '，或在对话里让我调用 ', h('code', null, 'test_live_run'), '。'),
             h('div', null, '运行中的输出会逐行出现在这里，结束后给出失败汇总。'),
           ),

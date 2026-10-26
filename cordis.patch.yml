@@ -10,12 +10,21 @@
 #
 # The row id doubles as the settings namespace: override any value below in the
 # profile's own cordis.patch.yml with an id-targeted config entry.
+#
+# The panel is a *host-wide* test log: a run belongs to the conversation that
+# started it, not to a project directory. Every key below is one of the values
+# `src/core/config.js` resolves; the comments state what the code actually does.
 - insert:
     - id: test-live
       name: 'dsh-test-live'
       config:
-        # Working directory of the test command. `null` means "the host process
-        # working directory", resolved per run.
+        # 'go-test' appends -v/-race/-count/-run/-timeout and package patterns;
+        # 'command' runs exactly `command + baseArgs` and ignores those options.
+        kind: 'go-test'
+        # FALLBACK run directory only. A run belongs to a conversation and is
+        # spawned in that conversation's cwd; this value is used only when the
+        # call carries no session directory (older host, direct API caller).
+        # `null` means "wherever the host process happens to run".
         cwd: null
         # The executable. Only this binary is ever spawned: the HTTP surface
         # cannot run arbitrary commands.
@@ -24,16 +33,42 @@
         baseArgs: ['test']
         # Extra environment variables for the child process.
         env: {}
-        # How many finished runs stay queryable (newest kept).
-        maxRuns: 8
+        # In-memory history: how many finished runs stay queryable in one host
+        # process (newest kept). Paging deeper than this needs the on-disk file.
+        maxRuns: 30
+        # Durable history: how many runs, and how many tail lines per run, reach
+        # the state file. The head of a long log is deliberately not persisted.
+        historyRuns: 100
+        historyLines: 200
+        # Where the durable history lives: one file shared by every conversation
+        # on the host. `''` keeps the default
+        # `${DSH_HOME:-~/.dsh}/test-live/runs.json`; write another ABSOLUTE path
+        # (e.g. /var/lib/dsh/test-live/runs.json) to move it. `null` or `false`
+        # turns persistence OFF — memory only, cleared on host restart, which is
+        # what the tests do. Mind the asymmetry with config.js: there
+        # `DEFAULTS.stateFile: null` documents "derive the default path", while
+        # the same `null` in this row means "disabled", so `''` is the value
+        # that keeps the default behaviour explicitly.
+        stateFile: ''
+        # Which slice of the log the panel opens on: 'all' = every conversation
+        # on this host, 'session' = only the conversation the tab is open in.
+        # The user can still switch both ways in the panel; this is the default.
+        defaultScope: 'all'
         # Per-run line buffer ceiling; older lines are dropped (seq keeps counting).
         maxLines: 20000
         # Default wall-clock cap in seconds, overridable per run.
         defaultTimeoutSec: 900
         # File-follow mode: an external writer (terminal, bash, CI) tees into a
-        # file and the panel tails it. followRoot bounds which files are
-        # readable; null means "same as cwd".
+        # file and the panel tails it. This is the legacy single root and the
+        # single-value alias of `followRoots` below; null means "no extra root".
         followRoot: null
+        # Ordered ALLOW-LIST of roots a followed file may live in; the panel
+        # shows them as a picker. A conversation's own directory is added to
+        # this list automatically for calls made from it, so a log in the
+        # project being worked on is reachable without being listed here —
+        # anything outside every root is still refused. An empty list means
+        # "the historical single root" (`followRoot`, else `cwd`).
+        followRoots: []
         # How often a followed file is polled, in milliseconds.
         followIntervalMs: 300
         # Panel appearance only; the run protocol itself is unaffected.

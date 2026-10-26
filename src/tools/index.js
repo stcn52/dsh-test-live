@@ -1,10 +1,14 @@
 /**
- * Three tools over the same run registry the panel uses.
+ * Four tools over the same run registry the panel uses.
  *
  * They exist so the model can start a run and read the result without a second
  * log channel: everything the tool reports is also what the panel shows live.
+ * A run started from a tool belongs to the conversation the call came from, so
+ * the panel groups it with that conversation and spawns it in its cwd.
  * @module dsh-test-live/tools
  */
+
+import { selectFollowRoot } from '../host/routes.js'
 
 /** How many trailing lines a tool output carries by default. */
 const DEFAULT_TAIL = 120
@@ -14,6 +18,95 @@ const DEFAULT_WAIT_SEC = 60
 const MAX_WAIT_SEC = 300
 /** How long a canceled call waits for the kill to be observed. */
 const SETTLE_MS = 5000
+/** Rows `test_live_runs` lists when the caller names no limit. */
+const DEFAULT_LIST_LIMIT = 10
+/** Cap on `test_live_runs` rows, so one call cannot dump the whole history. */
+const MAX_LIST_LIMIT = 100
+/** Cap on the trailing lines `test_live_runs` may append in total. */
+const MAX_LIST_TAIL_LINES = 200
+
+/**
+ * @param value - any value.
+ * @returns the trimmed string, or null when it carries nothing.
+ */
+function textOf(value) {
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : null
+}
+
+/**
+ * The conversation a tool call belongs to.
+ *
+ * `exec.agent.session` is the platform's own session object; the resolver turns
+ * it into the id/label/cwd triple the hub stores. Everything degrades to nulls:
+ * a host without a session service, or a resolver that throws, must still let
+ * the tool run.
+ * @param exec - tool execution context.
+ * @param resolver - session resolver ({describe, list}) or undefined.
+ * @param origin - 'tool' for anything a model called.
+ * @returns {{sessionId: string|null, sessionLabel: string|null, cwd: string|null, origin: string}}
+ */
+function callContext(exec, resolver, origin) {
+  const context = { sessionId: null, sessionLabel: null, cwd: null, origin }
+  const session = exec?.agent?.session
+  if (session === null || session === undefined) return context
+  let described = null
+  try {
+    if (resolver !== null && typeof resolver === 'object' && typeof resolver.describe === 'function') {
+      described = resolver.describe(session)
+    }
+  } catch {
+    described = null
+  }
+  if (described === null || typeof described !== 'object') return context
+  context.sessionId = textOf(described.sessionId)
+  context.sessionLabel = textOf(described.sessionLabel)
+  context.cwd = textOf(described.cwd)
+  return context
+}
+
+/**
+ * The run a status/cancel call means.
+ *
+ * An explicit id wins. Otherwise an explicit `sessionId` scopes the lookup, and
+ * with neither the call is scoped to the conversation that made it — a status
+ * read should describe this conversation's run, and a cancel must never stop a
+ * run another conversation owns just because it is the newest on the host. A
+ * call that arrives without a conversation (an older host, a direct API caller)
+ * still gets the host-wide newest run it always got.
+ * @param hub - run registry.
+ * @param options - tool arguments.
+ * @param exec - tool execution context.
+ * @param resolver - session resolver or undefined.
+ * @returns {{meta: object|null, sessionId: string|null, scoped: boolean}}
+ */
+function targetRun(hub, options, exec, resolver) {
+  const explicit = textOf(options.id)
+  if (explicit !== null) return { meta: hub.get(explicit) ?? null, sessionId: null, scoped: false }
+  const fromCall = textOf(options.sessionId) ?? callContext(exec, resolver, 'tool').sessionId
+  if (fromCall !== null) {
+    return { meta: hub.latest({ sessionId: fromCall }) ?? null, sessionId: fromCall, scoped: true }
+  }
+  return { meta: hub.latest() ?? null, sessionId: null, scoped: false }
+}
+
+/**
+ * Format one list row: id, status, duration, conversation, cwd, summary.
+ * @param meta - run meta.
+ * @returns one line of text.
+ */
+function runLine(meta) {
+  const duration = Number.isFinite(meta.durationMs) ? `${(meta.durationMs / 1000).toFixed(1)}s` : '-'
+  const parts = [meta.id, meta.status, duration]
+  if (meta.kind === 'file') parts.push('file')
+  const who = textOf(meta.sessionLabel) ?? textOf(meta.sessionId)
+  if (who !== null) parts.push(`对话 ${who}`)
+  if (textOf(meta.cwd) !== null) parts.push(meta.cwd)
+  if (meta.origin === 'tool' || meta.origin === 'panel') parts.push(meta.origin)
+  if (meta.archived === true) parts.push('历史')
+  const summary = typeof meta.summaryText === 'string' ? (meta.summaryText.split('\n')[0] ?? '').trim() : ''
+  const line = parts.filter(part => part !== null && part !== undefined && part !== '').join(' · ')
+  return summary === '' ? line : `${line} · ${summary}`
+}
 
 /**
  * @param hub - run registry.
@@ -27,9 +120,11 @@ function report(hub, meta, tail) {
   const slice = lines.slice(-visible)
   const body = slice.map(entry => entry.text).join('\n')
   const omitted = lines.length - slice.length
+  const who = textOf(meta.sessionLabel) ?? textOf(meta.sessionId)
   return [
     `${meta.command} ${meta.args.join(' ')}`,
     `cwd: ${meta.cwd}`,
+    who === null ? '' : `session: ${who}`,
     meta.summaryText,
     omitted > 0 ? `(last ${slice.length} of ${lines.length} lines)` : '',
     body,
@@ -40,8 +135,9 @@ function report(hub, meta, tail) {
  * Register the tools on the calling plugin's fiber.
  * @param ctx - Cordis context with the `tools` service injected.
  * @param hub - run registry.
+ * @param resolver - session resolver ({describe, list}); optional.
  */
-export function registerTools(ctx, hub) {
+export function registerTools(ctx, hub, resolver) {
   ctx.tools.register({
     name: 'test_live_run',
     description: [
@@ -82,7 +178,9 @@ export function registerTools(ctx, hub) {
     },
     async execute(args, exec) {
       const options = args && typeof args === 'object' ? args : {}
-      const meta = hub.start(options)
+      // Ownership comes from the call, never from the arguments: the run belongs
+      // to the conversation that asked for it and is spawned in that cwd.
+      const meta = hub.start(options, callContext(exec, resolver, 'tool'))
       if (options.wait !== true) {
         return {
           id: meta.id,
@@ -126,13 +224,15 @@ export function registerTools(ctx, hub) {
   ctx.tools.register({
     name: 'test_live_status',
     description: [
-      'Read one dsh-test-live run (the latest by default): status, per-package counters, failures and the tail of the log.',
-      'Use it to follow a run started by test_live_run or from the sidebar panel, and to see whether it is still running.',
+      'Read one dsh-test-live run: status, per-package counters, failures and the tail of the log.',
+      'Defaults to the newest run of the current conversation; pass sessionId to read another conversation,',
+      'or id for one exact run. Use test_live_runs to see what other conversations are running.',
     ].join(' '),
     parameters: {
       type: 'object',
       properties: {
-        id: { type: 'string', description: 'Run id; defaults to the most recent run.' },
+        id: { type: 'string', description: 'Run id; defaults to the newest run of this conversation.' },
+        sessionId: { type: 'string', description: 'Read the newest run of this conversation id instead.' },
         tail: { type: 'integer', description: 'Trailing log lines to include (default 120).' },
       },
       additionalProperties: false,
@@ -141,10 +241,17 @@ export function registerTools(ctx, hub) {
       schema: {},
       render: (_args, value) => [{ type: 'text', text: value.text }],
     },
-    execute(args) {
+    execute(args, exec) {
       const options = args && typeof args === 'object' ? args : {}
-      const meta = typeof options.id === 'string' && options.id !== '' ? hub.get(options.id) : hub.latest()
-      if (meta === null) return { status: 'none', text: 'no test run has started yet' }
+      const { meta, scoped } = targetRun(hub, options, exec, resolver)
+      if (meta === null) {
+        return {
+          status: 'none',
+          text: scoped
+            ? 'this conversation has no test run yet; test_live_runs lists every conversation'
+            : 'no test run has started yet',
+        }
+      }
       return { id: meta.id, status: meta.status, text: report(hub, meta, options.tail) }
     },
   })
@@ -154,7 +261,8 @@ export function registerTools(ctx, hub) {
     description: [
       'Follow a log file in the dsh-test-live panel: an external writer (a terminal, a bash call, CI)',
       'tees its output into the file and the panel streams it line by line with the same colouring and summary.',
-      'The path must stay inside the configured follow root (config.followRoot, else config.cwd).',
+      'The path must stay inside an allowed root: the configured follow roots (config.followRoots, else followRoot or cwd),',
+      'plus the calling conversation\u2019s own working directory. Anything outside every root is refused.',
       'Follow runs stay "running" until test_live_cancel stops them.',
     ].join(' '),
     parameters: {
@@ -172,9 +280,14 @@ export function registerTools(ctx, hub) {
       schema: {},
       render: (_args, value) => [{ type: 'text', text: value.text }],
     },
-    execute(args) {
+    execute(args, exec) {
       const options = args && typeof args === 'object' ? args : {}
-      const meta = hub.follow(options.path)
+      // The conversation's cwd joins the allowed roots for this follow, so a log
+      // inside the conversation's directory is reachable; anything outside every
+      // root still throws and surfaces as a tool error.
+      const context = callContext(exec, resolver, 'tool')
+      const root = selectFollowRoot(hub, context, options.path, undefined)
+      const meta = hub.follow(options.path, root, context)
       return {
         id: meta.id,
         status: meta.status,
@@ -185,12 +298,24 @@ export function registerTools(ctx, hub) {
   })
 
   ctx.tools.register({
-    name: 'test_live_cancel',
-    description: 'Stop a running dsh-test-live test run (the latest running one by default).',
+    name: 'test_live_runs',
+    description: [
+      'List recent dsh-test-live runs, newest first: status, duration, the conversation that owns it, its cwd and',
+      'the run summary. Lists every conversation on the host by default; pass sessionId to list one conversation.',
+      'Use it before test_live_status to find the run id you want, or to see what other conversations are running.',
+    ].join(' '),
     parameters: {
       type: 'object',
       properties: {
-        id: { type: 'string', description: 'Run id; defaults to the most recent run.' },
+        sessionId: { type: 'string', description: 'Only list runs owned by this conversation id.' },
+        limit: {
+          type: 'integer',
+          description: `How many runs to list (default ${DEFAULT_LIST_LIMIT}, capped at ${MAX_LIST_LIMIT}).`,
+        },
+        tail: {
+          type: 'integer',
+          description: `Trailing log lines to append for each listed run (default 0, ${MAX_LIST_TAIL_LINES} lines in total).`,
+        },
       },
       additionalProperties: false,
     },
@@ -200,15 +325,71 @@ export function registerTools(ctx, hub) {
     },
     execute(args) {
       const options = args && typeof args === 'object' ? args : {}
-      const id = typeof options.id === 'string' && options.id !== '' ? options.id : hub.latest()?.id
-      if (id === undefined) return { canceled: false, text: 'there is no run to cancel' }
-      const canceled = hub.cancel(id)
-      const run = hub.get(id)
+      const sessionId = textOf(options.sessionId)
+      const askedLimit = Number.isInteger(options.limit) && options.limit > 0 ? options.limit : DEFAULT_LIST_LIMIT
+      const limit = Math.min(askedLimit, MAX_LIST_LIMIT)
+      const runs = hub.list(sessionId === null ? { limit } : { sessionId, limit }) ?? []
+      if (runs.length === 0) {
+        return {
+          count: 0,
+          text: sessionId === null
+            ? 'no test run has started yet'
+            : `conversation ${sessionId} has no test run yet`,
+        }
+      }
+      const where = sessionId === null ? 'every conversation' : `conversation ${sessionId}`
+      const tail = Number.isInteger(options.tail) && options.tail > 0 ? options.tail : 0
+      const body = []
+      let budget = MAX_LIST_TAIL_LINES
+      for (const meta of runs) {
+        body.push(runLine(meta))
+        if (tail === 0 || budget <= 0) continue
+        const lines = (hub.linesSince(meta.id, -1) ?? []).slice(-Math.min(tail, budget))
+        if (lines.length === 0) continue
+        budget -= lines.length
+        for (const entry of lines) body.push(`  | ${entry.text}`)
+      }
       return {
-        id,
+        count: runs.length,
+        text: [`${runs.length} run(s) (${where}), newest first`, ...body].join('\n'),
+      }
+    },
+  })
+
+  ctx.tools.register({
+    name: 'test_live_cancel',
+    description: [
+      'Stop a running dsh-test-live test run: the newest running run of the current conversation,',
+      'or one exact run by id (pass sessionId to target another conversation).',
+    ].join(' '),
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Run id; defaults to the newest run of this conversation.' },
+        sessionId: { type: 'string', description: 'Cancel the newest run of this conversation id instead.' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: {},
+      render: (_args, value) => [{ type: 'text', text: value.text }],
+    },
+    execute(args, exec) {
+      const options = args && typeof args === 'object' ? args : {}
+      const { meta, scoped } = targetRun(hub, options, exec, resolver)
+      if (meta === null) {
+        return {
+          canceled: false,
+          text: scoped ? 'this conversation has no run to cancel' : 'there is no run to cancel',
+        }
+      }
+      const canceled = hub.cancel(meta.id)
+      const run = hub.get(meta.id)
+      return {
+        id: meta.id,
         canceled,
         status: run?.status ?? 'unknown',
-        text: canceled ? `canceled ${id}` : `could not cancel ${id} (status ${run?.status ?? 'unknown'})`,
+        text: canceled ? `canceled ${meta.id}` : `could not cancel ${meta.id} (status ${run?.status ?? 'unknown'})`,
       }
     },
   })

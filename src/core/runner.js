@@ -3,44 +3,212 @@
  * fan-out for the SSE endpoint and the tools.
  *
  * Why in-process instead of a background job: the panel must see lines while the
- * process is still running, which means the host has to hold the pipe. Nothing
- * is persisted — a host restart drops finished runs, which is the honest
- * lifetime for "what is happening in this test run right now".
+ * process is still running, which means the host has to hold the pipe.
+ *
+ * Lifetime: a run is owned by the **conversation** that started it (not by a
+ * project directory) and outlives the host process — finished runs are written
+ * through `core/store.js` and replayed into the same registry at startup, marked
+ * `archived`. A run that was still `running` when the host died is replayed as
+ * `canceled`, because its child is gone and pretending otherwise would leave a
+ * spinner nobody can stop.
  * @module dsh-test-live/runner
  */
 
 import { randomUUID } from 'node:crypto'
 import { spawn as nodeSpawn } from 'node:child_process'
+import { lstatSync, realpathSync } from 'node:fs'
 import { open, stat } from 'node:fs/promises'
-import { dirname, resolve, sep } from 'node:path'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 import { buildArgs, normalizeRunOptions } from './config.js'
 import { classifyLine, createSummary, deriveStatus, observeLine, summarize } from './parse.js'
+import { createRunStore } from './store.js'
 
 /** Synthetic line emitted when the child cannot even start. */
 const SPAWN_FAILURE_PREFIX = 'cannot start '
+
+/** Error recorded on a run that was alive when the host restarted. */
+export const INTERRUPTED_ERROR = '宿主重启，运行被中断'
+
+/** Statuses a stored run may carry; anything else is treated as failed. */
+const STORED_STATUSES = new Set(['running', 'passed', 'failed', 'canceled'])
 
 /** Largest chunk read from a followed file per tick (keeps one read bounded). */
 const MAX_FOLLOW_CHUNK = 1 << 20
 
 /**
- * Resolve a follow path against the allowed root and refuse anything outside it.
- * The panel is reachable over the LAN, so following an arbitrary host path would
- * turn it into a file reader.
+ * @param value - candidate.
+ * @returns the absolute path, or null (a relative cwd would silently resolve
+ * against the host's directory and run the tests in the wrong project).
+ */
+function absolutePathOrNull(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed.startsWith('/') ? trimmed : null
+}
+
+/**
+ * @param value - candidate.
+ * @returns the trimmed non-empty string, else null.
+ */
+function textOrNull(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed === '' ? null : trimmed
+}
+
+/**
+ * Normalize the caller-supplied run ownership.
+ *
+ * `context` is what the routes/tools learned from the session resolver; every
+ * field is optional so an old client that knows nothing about conversations
+ * still starts a run (it just gets no owner).
+ * @param context - `{ sessionId, sessionLabel, cwd, origin }` or anything.
+ * @returns the four normalized fields, null/false when absent.
+ */
+export function normalizeContext(context) {
+  const input = context !== null && typeof context === 'object' ? context : {}
+  return {
+    sessionId: textOrNull(input.sessionId),
+    sessionLabel: textOrNull(input.sessionLabel),
+    cwd: absolutePathOrNull(input.cwd),
+    origin: input.origin === 'tool' || input.origin === 'panel' ? input.origin : null,
+  }
+}
+
+/**
+ * A run id that does not collide across restarts.
+ *
+ * The old id was eight hex characters of a random UUID: unique inside one
+ * process, but 32 bits is not enough once ids are replayed from disk and the
+ * panel links to a run by id alone. The base-36 millisecond stamp pins the order
+ * and two random bytes break ties within the same millisecond.
+ * @returns run id.
+ */
+function makeRunId() {
+  return `run_${Date.now().toString(36)}${randomUUID().slice(0, 4)}`
+}
+
+/**
+ * The roots this deployment allows a follow to read, in panel order.
+ *
+ * `followRoots` is the allow-list; an empty list falls back to the historical
+ * single root (`followRoot`, else `cwd`, else the process directory), so a
+ * profile written before the list existed behaves exactly as it did.
+ * @param settings - resolved plugin config.
+ * @returns absolute root strings.
+ */
+export function allowedFollowRoots(settings) {
+  const roots = Array.isArray(settings.followRoots)
+    ? settings.followRoots.filter(root => typeof root === 'string' && root.trim() !== '')
+    : []
+  if (roots.length > 0) return roots.slice()
+  return [settings.followRoot ?? settings.cwd ?? process.cwd()]
+}
+
+/**
+ * The root a relative path is resolved against when the caller names none.
+ * @param settings - resolved plugin config.
+ * @returns absolute root.
+ */
+function defaultFollowRoot(settings) {
+  const listed = Array.isArray(settings.followRoots) && settings.followRoots.length > 0 ? settings.followRoots[0] : null
+  return settings.followRoot ?? listed ?? settings.cwd ?? process.cwd()
+}
+
+/**
+ * Resolve a path to its real location without requiring the tail to exist.
+ *
+ * `realpathSync` refuses a path whose last component is missing yet, and a
+ * followed log legitimately appears after the follow starts (`tail -F`). So the
+ * deepest existing ancestor is resolved and the missing tail is re-appended.
+ * @param target - absolute path.
+ * @returns the real path, or null for a dangling symlink (it would name a file
+ * outside the tree the moment a writer created the target).
+ */
+function realPathLenient(target) {
+  let current = target
+  const missing = []
+  for (;;) {
+    try {
+      const real = realpathSync(current)
+      return missing.length === 0 ? real : join(real, ...missing)
+    } catch (error) {
+      if (error === null || typeof error !== 'object' || (error.code !== 'ENOENT' && error.code !== 'ENOTDIR')) {
+        return target
+      }
+      try {
+        if (lstatSync(current).isSymbolicLink()) return null
+      } catch {
+        // Not there at all: an ordinary missing component, keep walking up.
+      }
+      const parent = dirname(current)
+      if (parent === current) return target
+      missing.unshift(basename(current))
+      current = parent
+    }
+  }
+}
+
+/**
+ * Resolve a follow path against the allowed roots and refuse anything outside
+ * them. The panel is reachable over the LAN, so following an arbitrary host
+ * path would turn it into a file reader.
+ *
+ * The prefix test runs on real paths, not on the literal string: a symlink
+ * planted inside a root must not become a window onto `/etc`.
  * @param inputPath - caller-supplied path (absolute or relative to the root).
  * @param settings - resolved plugin config.
+ * @param root - optional explicit root; must be one of {@link allowedFollowRoots}.
  * @returns absolute path inside the root.
  */
-export function resolveFollowPath(inputPath, settings) {
+export function resolveFollowPath(inputPath, settings, root) {
+  return resolveFollowPathIn(inputPath, allowedFollowRoots(settings), defaultFollowRoot(settings), root)
+}
+
+/**
+ * Resolve a follow path against an explicit allow-list.
+ *
+ * The list is a parameter because the hub validates against
+ * {@link followRootsFor}: the deployment roots *plus* the calling session's own
+ * working directory, so a conversation may follow a log in the project it is
+ * working in without that path having to be in the static profile.
+ * @param inputPath - caller-supplied path.
+ * @param roots - absolute allow-list (first entry is the default root).
+ * @param fallbackRoot - root to use when the list is empty.
+ * @param root - optional explicit root; must be in `roots`.
+ * @returns absolute path inside one of the roots.
+ */
+function resolveFollowPathIn(inputPath, roots, fallbackRoot, root) {
   if (typeof inputPath !== 'string' || inputPath.trim() === '') {
     throw new Error('follow path is required')
   }
-  const base = resolve(settings.followRoot ?? settings.cwd ?? process.cwd())
+  if (root !== undefined && root !== null) assertConfiguredRoot(root, roots)
+  const base = resolve(root ?? roots[0] ?? fallbackRoot ?? process.cwd())
   const target = resolve(base, inputPath.trim())
-  const prefix = base.endsWith(sep) ? base : base + sep
-  if (target !== base && !target.startsWith(prefix)) {
+  const baseReal = realPathLenient(base) ?? base
+  const targetReal = realPathLenient(target)
+  if (targetReal === null) {
+    throw new Error(`follow path "${inputPath}" is a dangling symbolic link`)
+  }
+  const prefix = baseReal.endsWith(sep) ? baseReal : baseReal + sep
+  if (targetReal !== baseReal && !targetReal.startsWith(prefix)) {
     throw new Error(`follow path "${inputPath}" is outside ${base}`)
   }
   return target
+}
+
+/**
+ * Refuse a root the deployment never configured: the panel may pick among the
+ * configured roots but may not widen the allow-list from a request.
+ * @param root - candidate root from HTTP or a tool call.
+ * @param roots - the allow-list for this call.
+ */
+function assertConfiguredRoot(root, roots) {
+  const wanted = resolve(String(root).trim())
+  const known = roots.some(candidate => resolve(candidate) === wanted)
+  if (!known) {
+    throw new Error(`follow root "${root}" is not one of the configured follow roots`)
+  }
 }
 
 /**
@@ -65,36 +233,104 @@ export function drainLines(text, carry) {
  * Create the run hub.
  * @param settings - resolved plugin config.
  * @param deps - test seams: `spawn` (defaults to child_process.spawn), `now`,
- * and `signalProcess` (defaults to process.kill; the group-kill seam).
+ * `signalProcess` (defaults to process.kill; the group-kill seam), and `store`
+ * (defaults to one built from `settings.stateFile`; pass null to keep runs in
+ * memory only).
  * @returns hub API used by routes and tools.
  */
 export function createHub(settings, deps = {}) {
   const spawn = deps.spawn ?? nodeSpawn
   const now = deps.now ?? (() => Date.now())
   const signalProcess = deps.signalProcess ?? ((pid, signal) => process.kill(pid, signal))
+  // `'store' in deps` (not `deps.store ?? …`) so an explicit null really means
+  // "no persistence", which is what the tests rely on.
+  const store =
+    'store' in deps
+      ? deps.store
+      : settings.stateFile === null || settings.stateFile === undefined
+        ? null
+        : createRunStore({
+            stateFile: settings.stateFile,
+            historyRuns: settings.historyRuns,
+            historyLines: settings.historyLines,
+          })
   /** @type {Map<string, object>} */
   const runs = new Map()
   /** insertion order of ids, oldest first */
   const order = []
 
   /**
-   * Register a run and start its child process.
-   * @param options - raw run options from HTTP or a tool.
-   * @returns the run meta (the panel binds to its id).
+   * Directory the next spawned run starts in.
+   *
+   * Precedence: the session's own cwd (the run happens where the conversation
+   * is), then the deployment hook, then `config.cwd`, then the host directory.
+   * `config.cwd` is a fallback, not the owner: a fleet-wide log must not stamp
+   * every run with one project.
+   * @param context - normalized run ownership.
+   * @returns absolute directory.
    */
+  function spawnCwd(context) {
+    const provided = typeof deps.cwdFor === 'function' ? deps.cwdFor(context) : undefined
+    return absolutePathOrNull(context?.cwd) ?? absolutePathOrNull(provided) ?? settings.cwd ?? process.cwd()
+  }
+
   /**
-   * Register one run in the history and return it.
-   * @param fields - overrides of the defaults (kind, command, args, cwd, ...).
-   * @returns run state.
+   * @returns the configured follow roots, in panel order.
    */
-  function createRun(fields) {
-    const run = {
-      id: `run_${randomUUID().slice(0, 8)}`,
+  function roots() {
+    return allowedFollowRoots(settings)
+  }
+
+  /**
+   * @returns the configured run directory, for the panel's root picker label.
+   */
+  function cwd() {
+    return settings.cwd ?? process.cwd()
+  }
+
+  /**
+   * The roots a call from `context` may follow files in: the deployment's
+   * allow-list plus the session's working directory.
+   *
+   * This is what keeps a follow useful without turning the panel into a file
+   * reader: a conversation may read its own project, not the whole disk.
+   * @param context - run ownership (raw or normalized; may be undefined).
+   * @returns absolute root strings, config order first.
+   */
+  function followRootsFor(context) {
+    const normalized = normalizeContext(context)
+    const list = allowedFollowRoots(settings).map(root => resolve(root))
+    if (normalized.cwd !== null && !list.includes(resolve(normalized.cwd))) list.push(resolve(normalized.cwd))
+    return list
+  }
+
+  /**
+   * The in-memory shape of one run.
+   *
+   * Separated from {@link createRun} so history replay can build a run without
+   * registering it (and without trimming, which would evict the very records
+   * being loaded).
+   * @param fields - overrides of the defaults (kind, command, args, cwd, ...).
+   * @returns run state (not yet in the registry).
+   */
+  function baseRun(fields) {
+    const input = fields ?? {}
+    let id = textOrNull(input.id) ?? makeRunId()
+    // A restored id must not collide with a live one; a fresh id is cheap and
+    // keeps the panel's id links unambiguous.
+    while (runs.has(id)) id = makeRunId()
+    return {
       kind: 'command',
       status: 'running',
       command: settings.command,
       args: [],
       cwd: settings.cwd ?? process.cwd(),
+      // Ownership: which conversation started it, under which label, from which
+      // surface, and whether it came back from disk rather than from this process.
+      sessionId: null,
+      sessionLabel: null,
+      origin: null,
+      archived: false,
       startedAt: now(),
       finishedAt: null,
       durationMs: null,
@@ -120,27 +356,150 @@ export function createHub(settings, deps = {}) {
       file: null,
       offset: 0,
       followTimer: null,
-      ...fields,
+      ...input,
+      id,
     }
+  }
+
+  /**
+   * Register one run in the history and return it.
+   * @param fields - overrides of the defaults (kind, command, args, cwd, ...).
+   * @returns run state.
+   */
+  function createRun(fields) {
+    const run = baseRun(fields)
     runs.set(run.id, run)
     order.push(run.id)
     trimHistory()
+    persist()
     return run
+  }
+
+  /**
+   * The registry as the store wants it: oldest first, with the run's line
+   * counter exposed as `lastSeq` (the store trims the tail to `historyLines`).
+   * @returns run records.
+   */
+  function snapshot() {
+    return order
+      .map(id => runs.get(id))
+      .filter(Boolean)
+      .map(run => ({ ...run, lastSeq: run.seq }))
+  }
+
+  /**
+   * Hand the current registry to the store. The store throttles and never
+   * throws; a persistence problem degrades to "history is shorter after a
+   * restart", not to a failed run.
+   */
+  function persist() {
+    if (store === null) return
+    try {
+      store.save(snapshot())
+    } catch {
+      // The store is written defensively; this only guards a caller-supplied one.
+    }
+  }
+
+  /**
+   * Rebuild one run from a stored record.
+   *
+   * A run that was `running` when the host died is reported as `canceled` with
+   * {@link INTERRUPTED_ERROR}: its child is gone, and a permanent spinner would
+   * look cancellable but never stop.
+   * @param record - stored run record.
+   * @returns run state marked archived.
+   */
+  function restoreRun(record) {
+    const startedAt = typeof record.startedAt === 'number' ? record.startedAt : now()
+    const wasRunning = record.status === 'running'
+    const status = wasRunning ? 'canceled' : STORED_STATUSES.has(record.status) ? record.status : 'failed'
+    const finishedAt = wasRunning ? now() : typeof record.finishedAt === 'number' ? record.finishedAt : null
+    const lines = []
+    if (Array.isArray(record.lines)) {
+      for (const entry of record.lines) {
+        if (entry === null || typeof entry !== 'object') continue
+        const seq = Number.isInteger(entry.seq) && entry.seq > 0 ? entry.seq : lines.length + 1
+        const text = typeof entry.text === 'string' ? entry.text : String(entry.text ?? '')
+        lines.push({ seq, text, kind: textOrNull(entry.kind) ?? classifyLine(text), provisional: false })
+      }
+    }
+    const lastSeq = Number.isInteger(record.lastSeq) ? record.lastSeq : lines.length > 0 ? lines[lines.length - 1].seq : 0
+    const fresh = createSummary()
+    const stored = record.summary !== null && typeof record.summary === 'object' ? record.summary : null
+    const summary =
+      stored === null
+        ? fresh
+        : {
+            tests: { ...fresh.tests, ...(stored.tests ?? {}) },
+            packages: { ...fresh.packages, ...(stored.packages ?? {}) },
+            failures: Array.isArray(stored.failures) ? stored.failures.slice() : fresh.failures,
+            buildErrors: Array.isArray(stored.buildErrors) ? stored.buildErrors.slice() : fresh.buildErrors,
+            coverage: Array.isArray(stored.coverage) ? stored.coverage.slice() : fresh.coverage,
+          }
+    return baseRun({
+      id: record.id,
+      kind: record.kind === 'file' ? 'file' : 'command',
+      file: textOrNull(record.file),
+      status,
+      command: typeof record.command === 'string' ? record.command : settings.command,
+      args: Array.isArray(record.args) ? record.args.map(String) : [],
+      cwd: absolutePathOrNull(record.cwd) ?? settings.cwd ?? process.cwd(),
+      sessionId: textOrNull(record.sessionId),
+      sessionLabel: textOrNull(record.sessionLabel),
+      origin: record.origin === 'tool' || record.origin === 'panel' ? record.origin : null,
+      archived: true,
+      startedAt,
+      finishedAt,
+      durationMs: wasRunning ? finishedAt - startedAt : typeof record.durationMs === 'number' ? record.durationMs : null,
+      exitCode: Number.isInteger(record.exitCode) ? record.exitCode : null,
+      signal: textOrNull(record.signal),
+      error: wasRunning ? INTERRUPTED_ERROR : textOrNull(record.error),
+      timedOut: record.timedOut === true,
+      canceled: wasRunning || record.canceled === true,
+      timeoutSec: settings.defaultTimeoutSec,
+      truncated: record.truncated === true,
+      lines,
+      seq: Math.max(lastSeq, lines.length > 0 ? lines[lines.length - 1].seq : 0),
+      summary,
+    })
+  }
+
+  // Replay the stored history into the same registry before the first request.
+  if (store !== null) {
+    let restored = []
+    try {
+      restored = store.load()
+    } catch {
+      restored = []
+    }
+    for (const record of Array.isArray(restored) ? restored : []) {
+      if (record === null || typeof record !== 'object' || textOrNull(record.id) === null) continue
+      if (runs.has(record.id)) continue
+      const run = restoreRun(record)
+      runs.set(run.id, run)
+      order.push(run.id)
+    }
   }
 
   /**
    * Register a run and start its child process.
    * @param options - raw run options from HTTP or a tool.
+   * @param context - run ownership from the session resolver.
    * @returns the run meta (the panel binds to its id).
    */
-  function start(options) {
-    const normalized = normalizeRunOptions(options, settings)
+  function start(options, context) {
+    const normalizedOptions = normalizeRunOptions(options, settings)
+    const owner = normalizeContext(context)
     const run = createRun({
+      // `...owner` first: its `cwd` is the *session's* directory, which
+      // `spawnCwd` may well have rejected (relative) or overridden.
+      ...owner,
       kind: 'command',
       command: settings.command,
-      args: [...settings.baseArgs, ...buildArgs(normalized, settings.kind)],
-      cwd: settings.cwd ?? process.cwd(),
-      timeoutSec: normalized.timeoutSec,
+      args: [...settings.baseArgs, ...buildArgs(normalizedOptions, settings.kind)],
+      cwd: spawnCwd(owner),
+      timeoutSec: normalizedOptions.timeoutSec,
     })
 
     let child
@@ -167,12 +526,12 @@ export function createHub(settings, deps = {}) {
       stream.on('data', chunk => appendChunk(run, chunk))
     }
     child.on('close', (code, signal) => finish(run, code, signal))
-    if (normalized.timeoutSec > 0) {
+    if (normalizedOptions.timeoutSec > 0) {
       run.timer = setTimeout(() => {
         run.timedOut = true
-        run.error = `timeout after ${normalized.timeoutSec}s`
+        run.error = `timeout after ${normalizedOptions.timeoutSec}s`
         kill(run)
-      }, normalized.timeoutSec * 1000)
+      }, normalizedOptions.timeoutSec * 1000)
       if (typeof run.timer.unref === 'function') run.timer.unref()
     }
     return metaOf(run)
@@ -279,6 +638,7 @@ export function createHub(settings, deps = {}) {
     run.status = deriveStatus(run.exitCode, run.canceled, run.timedOut, run.summary)
     clearTimer(run)
     notifyStatus(run)
+    persist()
   }
 
   /**
@@ -295,6 +655,7 @@ export function createHub(settings, deps = {}) {
     run.status = 'failed'
     clearTimer(run)
     notifyStatus(run)
+    persist()
   }
 
   /**
@@ -371,12 +732,22 @@ export function createHub(settings, deps = {}) {
    * The file is polled; every complete line goes through the same buffer,
    * classifier and SSE fan-out as a spawned run, so the panel behaves the same.
    * There is no exit code to observe: the run stays `running` until cancelled.
-   * @param inputPath - path inside the configured root.
+   * @param inputPath - path inside one of the roots this call is allowed to read.
+   * @param root - optional root to resolve against; must be allowed.
+   * @param context - run ownership; its cwd widens the allow-list for this call.
    * @returns run meta.
    */
-  function follow(inputPath) {
-    const file = resolveFollowPath(inputPath, settings)
-    const run = createRun({ kind: 'file', command: file, cwd: dirname(file), file })
+  function follow(inputPath, root, context) {
+    const owner = normalizeContext(context)
+    const file = resolveFollowPathIn(inputPath, followRootsFor(owner), defaultFollowRoot(settings), root)
+    const run = createRun({
+      ...owner,
+      kind: 'file',
+      command: file,
+      // A followed log lives where the file is, whatever the session cwd is.
+      cwd: dirname(file),
+      file,
+    })
     pumpFile(run)
     return metaOf(run)
   }
@@ -422,6 +793,7 @@ export function createHub(settings, deps = {}) {
         run.finishedAt = now()
         run.durationMs = run.finishedAt - run.startedAt
         notifyStatus(run)
+        persist()
         return
       }
     }
@@ -446,6 +818,7 @@ export function createHub(settings, deps = {}) {
     run.finishedAt = now()
     run.durationMs = run.finishedAt - run.startedAt
     notifyStatus(run)
+    persist()
     return true
   }
 
@@ -471,18 +844,63 @@ export function createHub(settings, deps = {}) {
   }
 
   /**
+   * @param filter - optional `{ sessionId?, limit? }`; a sessionId keeps only
+   * runs started from that conversation.
    * @returns metas, newest first.
    */
-  function list() {
-    return order.slice().reverse().map(id => metaOf(runs.get(id))).filter(Boolean)
+  function list(filter) {
+    const input = filter !== null && typeof filter === 'object' ? filter : {}
+    const sessionId = textOrNull(input.sessionId)
+    let metas = order
+      .slice()
+      .reverse()
+      .map(id => metaOf(runs.get(id)))
+      .filter(Boolean)
+    if (sessionId !== null) metas = metas.filter(meta => meta.sessionId === sessionId)
+    const limit = Number.isInteger(input.limit) && input.limit > 0 ? input.limit : null
+    return limit === null ? metas : metas.slice(0, limit)
   }
 
   /**
-   * @returns the newest run meta, or null.
+   * @param filter - optional `{ sessionId? }`.
+   * @returns the newest run meta (of that conversation), or null.
    */
-  function latest() {
-    const id = order[order.length - 1]
-    return id ? metaOf(runs.get(id)) : null
+  function latest(filter) {
+    const found = list(filter !== null && typeof filter === 'object' ? { ...filter, limit: 1 } : { limit: 1 })
+    return found.length > 0 ? found[0] : null
+  }
+
+  /**
+   * One row per conversation that owns at least one run, newest activity first.
+   *
+   * The panel's filter needs this: the host's session list may not include a
+   * session whose runs are all that is left of it (the conversation ended, the
+   * history remains), so the registry is the authority for run ownership.
+   * @returns `[{ id, label, cwd, count, running, lastAt }]`, newest first.
+   */
+  function sessions() {
+    /** @type {Map<string, object>} */
+    const byId = new Map()
+    for (const id of order) {
+      const run = runs.get(id)
+      if (!run || run.sessionId === null) continue
+      const row = byId.get(run.sessionId) ?? {
+        id: run.sessionId,
+        label: null,
+        cwd: null,
+        count: 0,
+        running: false,
+        lastAt: null,
+      }
+      row.count++
+      if (run.status === 'running') row.running = true
+      // The newest label/cwd wins: a session may be renamed or change directory.
+      if (run.sessionLabel !== null) row.label = run.sessionLabel
+      if (run.cwd !== null) row.cwd = run.cwd
+      if (row.lastAt === null || run.startedAt >= row.lastAt) row.lastAt = run.startedAt
+      byId.set(run.sessionId, row)
+    }
+    return [...byId.values()].sort((a, b) => (b.lastAt ?? 0) - (a.lastAt ?? 0))
   }
 
   /**
@@ -573,12 +991,21 @@ export function createHub(settings, deps = {}) {
       command: run.command,
       args: run.args,
       cwd: run.cwd,
+      // Ownership, so a fleet-wide panel can group and filter by conversation.
+      sessionId: run.sessionId,
+      sessionLabel: run.sessionLabel,
+      origin: run.origin,
+      archived: run.archived === true,
       startedAt: run.startedAt,
       finishedAt: run.finishedAt,
       durationMs: run.durationMs,
       exitCode: run.exitCode,
       signal: run.signal,
       error: run.error,
+      // Kept in the meta because the panel shows "已取消/超时" for a run whose
+      // exit code alone does not say why it stopped.
+      canceled: run.canceled === true,
+      timedOut: run.timedOut === true,
       timeoutSec: run.timeoutSec,
       truncated: run.truncated,
       buffered: run.lines.length,
@@ -611,7 +1038,32 @@ export function createHub(settings, deps = {}) {
       }
       run.listeners.clear()
     }
+    // Last chance to land the history: the plugin is unloading, no timer will
+    // survive it. `flush` is a no-op on a disabled store and never throws.
+    try {
+      store?.flush?.()
+    } catch {
+      // Persistence is best-effort by contract.
+    }
   }
 
-  return { start, follow, cancel, get, list, latest, linesSince, waitFor, subscribe, dispose }
+  return {
+    start,
+    follow,
+    cancel,
+    get,
+    list,
+    latest,
+    sessions,
+    linesSince,
+    waitFor,
+    subscribe,
+    dispose,
+    roots,
+    cwd,
+    followRootsFor,
+    persist,
+    // The panel's opening scope, read by the routes as `hub.defaultScope`.
+    defaultScope: settings.defaultScope === 'session' ? 'session' : 'all',
+  }
 }

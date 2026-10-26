@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 
 import {
   buildArgs,
+  defaultStateFile,
   normalizeRunOptions,
   resolveConfig,
 } from '../src/core/config.js'
@@ -13,18 +17,43 @@ import {
   observeLine,
   summarize,
 } from '../src/core/parse.js'
-import { drainLines } from '../src/core/runner.js'
+import { createHub, drainLines } from '../src/core/runner.js'
+import { createSessionResolver } from '../src/core/session.js'
+import { createRunStore } from '../src/core/store.js'
 
 test('resolveConfig keeps defaults and rejects unsafe executables', () => {
   const settings = resolveConfig(undefined)
   assert.equal(settings.command, 'go')
   assert.deepEqual(settings.baseArgs, ['test'])
   assert.equal(settings.cwd, null)
-  assert.equal(settings.maxRuns, 8)
+  // Bounded in-memory history; durable history is longer (historyRuns).
+  assert.equal(settings.maxRuns, 30)
+  assert.equal(settings.historyRuns, 100)
+  assert.equal(settings.historyLines, 200)
+  assert.equal(settings.defaultScope, 'all')
+  assert.equal(settings.followRoots.length, 0)
   assert.throws(() => resolveConfig({ command: 'rm -rf /' }), /plain executable name/)
   assert.throws(() => resolveConfig({ command: './go' }), /plain executable name/)
   assert.equal(resolveConfig({ command: '/usr/local/go/bin/go' }).command, '/usr/local/go/bin/go')
   assert.throws(() => resolveConfig({ cwd: 'relative/dir' }), /absolute path/)
+})
+
+test('resolveConfig derives a global state file and validates it', () => {
+  const previous = process.env.DSH_HOME
+  try {
+    process.env.DSH_HOME = '/tmp/dsh-home-for-test'
+    assert.equal(defaultStateFile(), '/tmp/dsh-home-for-test/test-live/runs.json')
+    assert.equal(resolveConfig({}).stateFile, '/tmp/dsh-home-for-test/test-live/runs.json')
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+  }
+  // An explicit null disables persistence; a relative path is refused.
+  assert.equal(resolveConfig({ stateFile: null }).stateFile, null)
+  assert.equal(resolveConfig({ stateFile: '/var/tmp/x.json' }).stateFile, '/var/tmp/x.json')
+  assert.throws(() => resolveConfig({ stateFile: 'relative/runs.json' }), /absolute path or null/)
+  assert.equal(resolveConfig({ defaultScope: 'session' }).defaultScope, 'session')
+  assert.equal(resolveConfig({ defaultScope: 'bogus' }).defaultScope, 'all')
 })
 
 test('resolveConfig stringifies env values', () => {
@@ -134,4 +163,156 @@ test('drainLines keeps the incomplete tail as carry', () => {
   assert.equal(second.carry, '')
   // A CRLF chunk must not leak the CR into the rendered line.
   assert.deepEqual(drainLines('x\r\n', '').lines, ['x'])
+})
+
+test('session resolver reads the host services and degrades quietly', () => {
+  const session = { id: 'session-a', header: { cwd: '/repo/a', title: 'Fix A' } }
+  const titles = new Map([[session, { title: 'Fix A (live)' }]])
+  const ctx = {
+    sessions: {
+      get: id => (id === 'session-a' ? session : undefined),
+      list: () => [session, { id: 'session-b', header: { cwd: '/repo/b' } }],
+    },
+    workingDirectory: { get: input => (input === session ? '/repo/a' : undefined) },
+    sessionTitle: { get: input => titles.get(input) },
+  }
+  const resolver = createSessionResolver(ctx)
+  assert.deepEqual(resolver.describe(session), {
+    sessionId: 'session-a',
+    sessionLabel: 'Fix A (live)',
+    cwd: '/repo/a',
+  })
+  assert.deepEqual(resolver.describe('session-a'), {
+    sessionId: 'session-a',
+    sessionLabel: 'Fix A (live)',
+    cwd: '/repo/a',
+  })
+  // Unknown id: the id survives, the rest is null (never a throw).
+  assert.deepEqual(resolver.describe('session-missing'), {
+    sessionId: 'session-missing',
+    sessionLabel: null,
+    cwd: null,
+  })
+  assert.deepEqual(resolver.describe(undefined), { sessionId: null, sessionLabel: null, cwd: null })
+  assert.deepEqual(resolver.describe('   '), { sessionId: null, sessionLabel: null, cwd: null })
+  assert.deepEqual(
+    resolver.list().map(entry => entry.sessionId),
+    ['session-a', 'session-b'],
+  )
+  // A host without any of the services, or one whose services throw.
+  assert.deepEqual(createSessionResolver({}).describe('session-a'), {
+    sessionId: 'session-a',
+    sessionLabel: null,
+    cwd: null,
+  })
+  assert.deepEqual(createSessionResolver(undefined).list(), [])
+  const angry = {
+    sessions: {
+      get() {
+        throw new Error('boom')
+      },
+      list() {
+        throw new Error('boom')
+      },
+    },
+    workingDirectory: {
+      get() {
+        throw new Error('boom')
+      },
+    },
+    sessionTitle: {
+      get() {
+        throw new Error('boom')
+      },
+    },
+  }
+  const broken = createSessionResolver(angry)
+  assert.deepEqual(broken.describe('session-a'), {
+    sessionId: 'session-a',
+    sessionLabel: null,
+    cwd: null,
+  })
+  assert.deepEqual(broken.list(), [])
+})
+
+test('run store round-trips, trims and survives a corrupt file', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-store-test-'))
+  try {
+    const stateFile = join(dir, 'nested', 'runs.json')
+    const store = createRunStore({ stateFile, historyRuns: 2, historyLines: 2, delayMs: 0 })
+    const run = id => ({
+      id,
+      kind: 'command',
+      status: 'passed',
+      command: 'go',
+      args: ['test'],
+      cwd: '/repo',
+      sessionId: 'session-a',
+      startedAt: 1,
+      finishedAt: 2,
+      durationMs: 1,
+      lastSeq: 3,
+      summary: { tests: { pass: 1, fail: 0, skip: 0 } },
+      lines: [
+        { seq: 1, text: 'one', kind: 'plain', provisional: false },
+        { seq: 2, text: 'two', kind: 'plain' },
+        { seq: 3, text: 'three', kind: 'plain' },
+      ],
+    })
+    store.save([run('run_a'), run('run_b'), run('run_c')])
+    assert.equal(store.flush(), true)
+    const loaded = createRunStore({ stateFile }).load()
+    // historyRuns = 2 keeps the newest two runs, historyLines = 2 the tail.
+    assert.deepEqual(loaded.map(record => record.id), ['run_b', 'run_c'])
+    assert.deepEqual(loaded[1].lines.map(line => line.text), ['two', 'three'])
+    assert.equal(loaded[1].lines[0].provisional, undefined)
+    assert.equal(loaded[1].sessionId, 'session-a')
+    assert.equal(loaded[1].lastSeq, 3)
+
+    // Corrupt file: no history, no throw.
+    writeFileSync(stateFile, '{not json')
+    assert.deepEqual(createRunStore({ stateFile }).load(), [])
+    // Missing file: no history, no throw.
+    assert.deepEqual(createRunStore({ stateFile: join(dir, 'nothing.json') }).load(), [])
+    // Disabled store: load/save/flush are no-ops.
+    const disabled = createRunStore({ stateFile: null })
+    assert.equal(disabled.enabled, false)
+    disabled.save([run('run_a')])
+    assert.equal(disabled.flush(), false)
+    assert.deepEqual(disabled.load(), [])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('the hub loads archived history before the first request', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-store-test-'))
+  try {
+    const stateFile = join(dir, 'runs.json')
+    const store = createRunStore({ stateFile })
+    store.save([
+      {
+        id: 'run_old',
+        kind: 'command',
+        status: 'passed',
+        command: 'go',
+        args: ['test'],
+        cwd: '/repo',
+        sessionId: 'session-a',
+        startedAt: 1,
+        finishedAt: 2,
+        lines: [{ seq: 1, text: 'ok  \tpkg/a\t0.1s', kind: 'package-ok' }],
+      },
+    ])
+    store.flush()
+    const hub = createHub(resolveConfig({ stateFile }), { spawn: () => assert.fail('must not spawn') })
+    assert.equal(hub.list().length, 1)
+    assert.equal(hub.list()[0].archived, true)
+    assert.equal(hub.list()[0].status, 'passed')
+    assert.equal(hub.linesSince('run_old', -1)[0].text, 'ok  \tpkg/a\t0.1s')
+    assert.equal(hub.sessions()[0].count, 1)
+    hub.dispose()
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
