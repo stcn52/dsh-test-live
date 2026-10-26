@@ -1,7 +1,7 @@
 {
   "name": "dsh-test-live",
-  "version": "0.2.0",
-  "description": "Host-wide live test log panel for DeepSeek Harness: every conversation's test runs in one sidebar list, streamed line by line over SSE with a per-run summary. A run belongs to the conversation that started it and runs in that conversation's directory; finished runs are kept in a shared state file, so history survives a host restart. Ships Go test-aware line classification (package results, FAIL/RUN markers, build errors) and four tools the model can call.",
+  "version": "0.3.0",
+  "description": "Host-wide live test log panel for DeepSeek Harness: every conversation's test runs in one sidebar list, streamed line by line over SSE with a per-run summary. A run belongs to the conversation that started it and runs in that conversation's directory; finished runs are kept in a shared state file. Runners are descriptor-driven (go test, vitest, jest, node --test, pytest, a gated package.json script, or a custom command), auto-detected from the project, each with its own output grammar and counters.",
   "type": "module",
   "main": "src/index.js",
   "exports": {
